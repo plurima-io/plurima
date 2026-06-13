@@ -1,0 +1,37 @@
+# Build
+build/
+.gradle/
+out/
+bin/
+
+# Local-only modules and notes excluded from the public release tree
+benchmarks/
+test-app/
+docs/design/
+docs/superpowers/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.classpath
+.project
+.settings/
+
+# Test reports
+*-reports/
+**/test-output/
+**/reports/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local config
+.env
+*.local

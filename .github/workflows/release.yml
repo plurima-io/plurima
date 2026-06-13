@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate publishing on the live integration suite. Plurima is heavily Kafka-
+  # protocol-sensitive (KIP-932 share consumer + classic consumer-group); the
+  # unit tests cover dispatcher / commit-frontier semantics but only the
+  # integration suite proves the wire-level behaviour. Publishing without
+  # running them was the original release.yml's biggest gap.
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    name: Live integration suite against Kafka 4.2.0
+    runs-on: ubuntu-latest
+
+    services:
+      kafka:
+        image: apache/kafka:4.2.0
+        ports:
+          - 9092:9092
+        env:
+          # KRaft single-node controller+broker — no ZooKeeper.
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          # KIP-932 share-group support: enable the share group coordinator
+          # protocol alongside classic + consumer, and turn on the broker-side
+          # share-group + share-coordinator subsystems. Keep this block IN SYNC
+          # with .github/workflows/ci.yml (same broker config exercises the
+          # same code paths).
+          KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer,share
+          KAFKA_SHARE_GROUP_ENABLE: "true"
+          KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+          # New share groups start at the earliest available offset (consistent
+          # with integration tests that produce before subscribe).
+          KAFKA_SHARE_AUTO_OFFSET_RESET: earliest
+          # Single-broker dev settings — replication 1 for everything.
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Wait for Kafka broker
+        run: |
+          # The services-block container starts in parallel with the job; give
+          # the broker up to 60s to become reachable before running tests.
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/9092) >/dev/null 2>&1; then
+              echo "Kafka reachable on localhost:9092 after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Kafka did not become reachable within 60s"
+          exit 1
+
+      - name: Run live integration suite (-PintegrationTests=true)
+        # --rerun-tasks belt-and-suspenders — see ci.yml comment.
+        run: ./gradlew --no-daemon --rerun-tasks :core:test :metrics:test -PintegrationTests=true --info
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: |
+            core/build/reports/tests/test/
+            metrics/build/reports/tests/test/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Publish. Gated on the live integration suite. Re-runs the unit-test phase
+  # locally (./gradlew build) as part of the publish task graph.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release to Central Portal
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Refuse non-tag refs
+        # Releases MUST come from a tag pushed to master. Even though workflow_dispatch
+        # is supported, it's only useful for re-running a tagged release — running it
+        # from a branch would publish whatever version is in the branch, including a
+        # SNAPSHOT or the wrong release. Refuse anything other than refs/tags/v*.
+        run: |
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+            echo "REFUSING to publish: ref '${GITHUB_REF}' is not a release tag (refs/tags/v*)."
+            echo "Tag the commit (e.g. git tag -s v0.1.0 -m 'release v0.1.0') and push the tag."
+            echo "For workflow_dispatch, select a tag ref in the GitHub UI."
+            exit 1
+          fi
+
+      - name: Verify the tag matches the project version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          ver=$(./gradlew --no-daemon -q properties | grep -E "^version:" | awk '{print $2}')
+          if [ "$tag" != "$ver" ]; then
+            echo "Tag v$tag does not match build version $ver"
+            exit 1
+          fi
+          if [[ "$ver" == *-SNAPSHOT ]]; then
+            echo "REFUSING to publish: version '$ver' is a SNAPSHOT."
+            echo "Release tags must point at a commit with a non-SNAPSHOT version in build.gradle.kts."
+            exit 1
+          fi
+
+      - name: Build + sign + publish to Central Portal
+        env:
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+          CENTRAL_NAMESPACE: io.plurima
+        run: |
+          if [ -z "$SONATYPE_USERNAME" ] || [ -z "$SIGNING_KEY" ]; then
+            echo "Required release secrets not configured. Exiting."
+            exit 1
+          fi
+          ./gradlew --no-daemon build publishLibraryPublicationToSonatypeRepository
+          token="$(printf '%s:%s' "$SONATYPE_USERNAME" "$SONATYPE_PASSWORD" | base64 | tr -d '\n')"
+          curl --fail-with-body -X POST \
+            -H "Authorization: Bearer $token" \
+            "https://ossrh-staging-api.central.sonatype.com/manual/upload/defaultRepository/${CENTRAL_NAMESPACE}?publishing_type=automatic"
