@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["master", "phase-*"]
+    branches: ["master", "phase-*", "fix_*"]
   pull_request:
     branches: ["master"]
 
@@ -85,7 +85,7 @@ jobs:
           KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
           KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
         options: >-
-          --health-cmd "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"
+          --health-cmd "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
