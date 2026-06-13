@@ -64,7 +64,9 @@ KAFKA_SHARE_AUTO_OFFSET_RESET: earliest
 ```
 
 For a full working example, see `.github/workflows/ci.yml` — the Kafka service block
-that powers the live integration suite.
+that powers the live integration suite. In GitHub service-container health checks,
+use `/opt/kafka/bin/kafka-topics.sh`; the Apache Kafka 4.2 Docker image does not
+put Kafka scripts on `PATH`.
 
 For the `earliest` start position, configure it broker-side (the client can't set this, per KIP-932). Either default it server-wide:
 
@@ -197,6 +199,8 @@ The `ConsumerContext ctx` exposes:
 ### Manual ack (`ManualAckListener`)
 
 ```java
+import org.apache.kafka.clients.consumer.AcknowledgeType;
+
 .manualAckListener((record, ack) -> {
     if (validate(record)) {
         ack.acknowledge(AcknowledgeType.ACCEPT);
@@ -206,7 +210,10 @@ The `ConsumerContext ctx` exposes:
 })
 ```
 
-`AckContext` extends `ConsumerContext` with `acknowledge(AcknowledgeType type)`. It's **idempotent** — the first `acknowledge` call wins; subsequent calls are silent no-ops.
+`AckContext` extends `ConsumerContext` with `acknowledge(AcknowledgeType type)`.
+`AcknowledgeType` is Kafka's `org.apache.kafka.clients.consumer.AcknowledgeType`.
+The call is **idempotent** — the first `acknowledge` call wins; subsequent calls
+are silent no-ops.
 
 If a manual-ack listener throws without acknowledging, the retry/DLT pipeline runs as usual.
 
@@ -432,7 +439,7 @@ PlurimaConsumer.<...>builder()
 
 ### What gets sent to the DLT
 
-The **original record's bytes** (key + value, exact) are produced to `{topic}.DLT` (or your custom naming). Plurima never re-serializes. The following headers are added (committed per design § 13.8):
+The **original record's bytes** (key + value, exact) are produced to `{topic}.DLT` (or your custom naming). Plurima never re-serializes. The following headers are added as the public DLT metadata contract:
 
 | Header | Value |
 |---|---|
@@ -534,7 +541,7 @@ to see the effective barrier and tune `multiplier`.
 
 ## Metrics
 
-Plurima emits 14 metrics (11 counters, 1 gauge, 2 timers) via a stable `PlurimaMetrics` interface. Defaults to no-op; opt in by wiring an implementation.
+Plurima emits 15 metrics (11 counters, 2 gauges, 2 timers) via a stable `PlurimaMetrics` interface. Defaults to no-op; opt in by wiring an implementation.
 
 ### Micrometer (recommended)
 
@@ -551,6 +558,8 @@ PlurimaConsumer.<...>builder()
 
 ### Emitted metrics
 
+Plurima emits 15 metrics: 11 counters, 2 gauges, and 2 timers.
+
 | Name | Type | Tags | Fired when |
 |---|---|---|---|
 | `plurima.consumer.records.polled` | Counter | `topic` | Each batch returned from poll() |
@@ -558,6 +567,7 @@ PlurimaConsumer.<...>builder()
 | `plurima.consumer.records.failed` | Counter | `topic`, `exception_class` | Listener throws |
 | `plurima.consumer.records.poison_pill` | Counter | `topic`, `cause` | RecordDeserialization or CorruptRecord |
 | `plurima.consumer.records.in_flight` | Gauge | `topic`, `group_id`, `client_id` | Current count of records being processed. Emitted by both SHARE and CLASSIC_BASIC. |
+| `plurima.consumer.barrier.timeout_ms` | Gauge | `topic`, `group_id`, `client_id` | Current adaptive/share drain barrier timeout in milliseconds. |
 | `plurima.consumer.retry.attempts` | Counter | `topic`, `attempt` | Each retry attempt |
 | `plurima.consumer.dlt.routed` | Counter | `topic`, `dlt_topic` | DLT send success |
 | `plurima.consumer.dlt.failures` | Counter | `topic`, `cause` | DLT send failure |
@@ -568,7 +578,8 @@ PlurimaConsumer.<...>builder()
 | `plurima.consumer.process.duration` | Timer | `topic` | Listener invocation latency |
 | `plurima.consumer.poll.duration` | Timer | — | Duration of a single poll() call |
 
-Metric names are **stable for v0.1.0 onward** (design § 13.7 / ADR-013). Additional metrics (gauges, histograms, timers) are planned in future minor releases.
+Metric names are **stable for the 0.1.x line**. Additional metrics may be added in
+future minor releases without removing or renaming the existing public metrics.
 
 ### Custom implementation
 
@@ -760,9 +771,9 @@ Without explicit deserializers, the consumer is `PlurimaConsumer<byte[], byte[]>
 
 ### Deferred metrics
 
-The v0.1.0 metrics surface is the 14 metrics listed above: 11 counters, 1 gauge
-(`plurima.consumer.records.in_flight`), and 2 timers
-(`plurima.consumer.process.duration`, `plurima.consumer.poll.duration`). Histograms
+The v0.1.0 metrics surface is the 15 metrics listed above: 11 counters, 2 gauges
+(`plurima.consumer.records.in_flight`, `plurima.consumer.barrier.timeout_ms`), and
+2 timers (`plurima.consumer.process.duration`, `plurima.consumer.poll.duration`). Histograms
 (`records.delivery_count`, etc.), the broker-lag gauge (`plurima.consumer.lag`,
 KIP-1226 bridge), and shard-internal gauges (`shard.queue.depth`, `shard.busy`) remain
 deferred for a follow-up minor release.
