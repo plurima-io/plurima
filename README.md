@@ -1,5 +1,9 @@
 # kafka-plurima
 
+<p align="center">
+  <img src="docs/assets/kafka-plurima.png" alt="kafka-plurima" width="720">
+</p>
+
 [![CI](https://github.com/plurima-io/kafka-plurima/actions/workflows/ci.yml/badge.svg)](https://github.com/plurima-io/kafka-plurima/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Java](https://img.shields.io/badge/Java-21%2B-orange.svg)](docs/UserGuide.md#prerequisites)
