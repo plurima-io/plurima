@@ -1,7 +1,7 @@
-# kafka-plurima
+# plurima
 
 <p align="center">
-  <img src="docs/assets/kafka-plurima.png" alt="kafka-plurima" width="720">
+  <img src="docs/assets/plurima.png" alt="plurima" width="720">
 </p>
 
 [![CI](https://github.com/plurima-io/kafka-plurima/actions/workflows/ci.yml/badge.svg)](https://github.com/plurima-io/kafka-plurima/actions/workflows/ci.yml)
@@ -218,8 +218,8 @@ Apache License 2.0. See [LICENSE](LICENSE).
 ## Trademark Notice
 
 KAFKA is a registered trademark of The Apache Software Foundation and has been
-licensed for use by kafka-plurima. kafka-plurima has no affiliation with and is
-not endorsed by The Apache Software Foundation.
+licensed for use by plurima. plurima has no affiliation with and is not endorsed
+by The Apache Software Foundation.
 
 See the [Apache Kafka trademark guidance](https://kafka.apache.org/community/trademark/).
 See [TRADEMARKS.md](TRADEMARKS.md) for the repository trademark notice.
