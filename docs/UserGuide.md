@@ -847,3 +847,12 @@ With `maxAttempts(0)`, the first failure is classified as retriable (matches `Th
 ## License
 
 Apache 2.0 — see [`LICENSE`](../LICENSE).
+
+## Trademark Notice
+
+KAFKA is a registered trademark of The Apache Software Foundation and has been
+licensed for use by kafka-plurima. kafka-plurima has no affiliation with and is
+not endorsed by The Apache Software Foundation.
+
+See the [Apache Kafka trademark guidance](https://kafka.apache.org/community/trademark/).
+See [`TRADEMARKS.md`](../TRADEMARKS.md) for the repository trademark notice.
