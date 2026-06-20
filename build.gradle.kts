@@ -1,5 +1,19 @@
 // Gradle 8.14+ compatible configuration (core plugins are automatically available)
 
+val publishedModules = setOf("core", "metrics", "spring-boot-starter")
+
+tasks.register("quickstart") {
+    group = "application"
+    description = "Run the Docker quick-start produce/consume example"
+    dependsOn(":test-app:runQuickstart")
+}
+
+tasks.register("benchmark") {
+    group = "application"
+    description = "Run the end-to-end Plurima-vs-vanilla Kafka benchmark"
+    dependsOn(":test-app:runBench")
+}
+
 allprojects {
     group = "io.plurima"
     // master branch carries the NEXT version as -SNAPSHOT. To cut a release:
@@ -52,6 +66,10 @@ subprojects {
     }
 
     plugins.withId("java-library") {
+        if (name !in publishedModules) {
+            return@withId
+        }
+
         extensions.configure<JavaPluginExtension> {
             withSourcesJar()
             withJavadocJar()
@@ -74,7 +92,7 @@ subprojects {
                             + "(KIP-932) and vanilla KafkaConsumer. Cross-cluster per-key FIFO with "
                             + "intra-partition parallelism, exponential retry, dead-letter routing, and "
                             + "Spring Boot integration.")
-                        url.set("https://github.com/plurima-io/kafka-plurima")
+                        url.set("https://github.com/plurima-io/plurima")
                         licenses {
                             license {
                                 name.set("The Apache License, Version 2.0")
@@ -88,9 +106,9 @@ subprojects {
                             }
                         }
                         scm {
-                            connection.set("scm:git:git://github.com/plurima-io/kafka-plurima.git")
-                            developerConnection.set("scm:git:ssh://github.com:plurima-io/kafka-plurima.git")
-                            url.set("https://github.com/plurima-io/kafka-plurima")
+                            connection.set("scm:git:git://github.com/plurima-io/plurima.git")
+                            developerConnection.set("scm:git:ssh://github.com/plurima-io/plurima.git")
+                            url.set("https://github.com/plurima-io/plurima")
                         }
                     }
                 }

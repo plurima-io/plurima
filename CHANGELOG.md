@@ -97,4 +97,4 @@ ordering on share groups was never load-bearing across the cluster.
 
 Internal pre-release iterations. No published artifacts. See git history for context.
 
-[0.1.0]: https://github.com/plurima-io/kafka-plurima/releases/tag/v0.1.0
+[0.1.0]: https://github.com/plurima-io/plurima/releases/tag/v0.1.0

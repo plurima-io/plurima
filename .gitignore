@@ -4,9 +4,7 @@ build/
 out/
 bin/
 
-# Local-only modules and notes excluded from the public release tree
-benchmarks/
-test-app/
+# Historical notes excluded from the public release tree
 docs/design/
 docs/superpowers/
 

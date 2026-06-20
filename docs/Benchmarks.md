@@ -26,6 +26,20 @@ All figures came from one captured run. Results vary with hardware, JVM state,
 broker load, record distribution, handler behavior, and Kafka configuration.
 They should not be interpreted as a universal performance guarantee.
 
+## Reproduce
+
+With a Kafka 4.2 broker available at `localhost:9092`:
+
+```bash
+./gradlew benchmark
+```
+
+To use another broker:
+
+```bash
+./gradlew benchmark -PappArgs="--bootstrap broker.example.com:9092"
+```
+
 ## Raw Summary
 
 ```text

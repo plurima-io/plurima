@@ -4,7 +4,7 @@
   <img src="docs/assets/plurima.png" alt="plurima" width="720">
 </p>
 
-[![CI](https://github.com/plurima-io/kafka-plurima/actions/workflows/ci.yml/badge.svg)](https://github.com/plurima-io/kafka-plurima/actions/workflows/ci.yml)
+[![CI](https://github.com/plurima-io/plurima/actions/workflows/ci.yml/badge.svg)](https://github.com/plurima-io/plurima/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Java](https://img.shields.io/badge/Java-21%2B-orange.svg)](docs/UserGuide.md#prerequisites)
 [![Kafka](https://img.shields.io/badge/Kafka-4.2%2B-231f20.svg)](docs/UserGuide.md#prerequisites)
@@ -59,6 +59,13 @@ See [Benchmark Results](docs/Benchmarks.md) for methodology, raw output, limitat
 and scenario details. These figures are from one local run and are not a general
 performance guarantee.
 
+The benchmark implementation is included in this repository. Run it against a
+local Kafka broker with:
+
+```bash
+./gradlew benchmark
+```
+
 ## Modules
 
 | Module | Maven coordinate | Purpose |
@@ -78,6 +85,20 @@ performance guarantee.
 For share groups, Kafka must have share support enabled on the broker. See the
 [User Guide prerequisites](docs/UserGuide.md#prerequisites) for exact broker
 properties and Docker environment variables.
+
+### Five-Minute Docker Quick Start
+
+Start Kafka 4.2 and run a real produce/consume round trip:
+
+```bash
+docker compose -f examples/docker-compose.yml up -d --wait
+./gradlew quickstart
+```
+
+The app creates a topic, starts a Plurima share consumer, produces ten records,
+verifies all ten were processed, and prints `QUICKSTART_OK`.
+
+See [examples/README.md](examples/README.md) for cleanup and troubleshooting.
 
 ## Quick Start
 
