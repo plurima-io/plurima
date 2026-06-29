@@ -39,8 +39,9 @@ public final class QuickstartApp {
             .concurrency(4)
             .pollTimeout(Duration.ofMillis(200))
             .lockDuration(Duration.ofSeconds(24))
-            .listener((record, context) -> {
-                values.add(new String(record.value(), StandardCharsets.UTF_8));
+            // Message-based handler (Tier-2 API): one Kafka-decoupled object, no ConsumerRecord.
+            .onMessage(msg -> {
+                values.add(new String(msg.value(), StandardCharsets.UTF_8));
                 processed.countDown();
             })
             .build()) {

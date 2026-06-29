@@ -25,27 +25,40 @@ public final class DltRouter implements AutoCloseable {
     private final Producer<byte[], byte[]> producer;
     private final DltConfig config;
     private final PlurimaMetrics metrics;
+    private final SlownessReleaseTracker slownessTracker; // nullable — null = subtract 0
 
     /** Production constructor: builds a {@link KafkaProducer} from {@code config}. */
     public DltRouter(DltConfig config) {
-        this(buildProducer(config), config, PlurimaMetrics.noOp());
+        this(buildProducer(config), config, PlurimaMetrics.noOp(), null);
     }
 
     /** Production constructor with metrics. */
     public DltRouter(DltConfig config, PlurimaMetrics metrics) {
-        this(buildProducer(config), config, metrics);
+        this(buildProducer(config), config, metrics, null);
+    }
+
+    /** Production constructor with metrics and slowness tracker (corrects the DLT attempt-count header). */
+    public DltRouter(DltConfig config, PlurimaMetrics metrics, SlownessReleaseTracker slownessTracker) {
+        this(buildProducer(config), config, metrics, slownessTracker);
     }
 
     /** Test seam: inject an in-memory or mock producer. Package-private. */
     DltRouter(Producer<byte[], byte[]> producer, DltConfig config) {
-        this(producer, config, PlurimaMetrics.noOp());
+        this(producer, config, PlurimaMetrics.noOp(), null);
     }
 
     /** Full constructor: inject producer and metrics. Package-private. */
     DltRouter(Producer<byte[], byte[]> producer, DltConfig config, PlurimaMetrics metrics) {
+        this(producer, config, metrics, null);
+    }
+
+    /** Full constructor: inject producer, metrics, and slowness tracker. Package-private. */
+    DltRouter(Producer<byte[], byte[]> producer, DltConfig config, PlurimaMetrics metrics,
+              SlownessReleaseTracker slownessTracker) {
         this.producer = producer;
         this.config = config;
         this.metrics = metrics;
+        this.slownessTracker = slownessTracker;
     }
 
     private static Producer<byte[], byte[]> buildProducer(DltConfig config) {
@@ -97,7 +110,10 @@ public final class DltRouter implements AutoCloseable {
         // been redelivered many times. Same calculation WorkerProcessor uses for retry
         // decisions; see WorkerProcessor effective-attempt comment.
         int dc = r.consumerRecord().deliveryCount().orElse((short) 1);
-        int effectiveAttempt = Math.max(r.attempt(), dc - 1);
+        // Subtract slowness-driven force-RELEASEs so the published attempt count reflects genuine
+        // failure retries, not drain-barrier redeliveries (mirrors RetryEngine's effective-attempt).
+        int slowness = slownessTracker == null ? 0 : slownessTracker.releaseCount(r.coord());
+        int effectiveAttempt = Math.max(r.attempt(), Math.max(0, (dc - 1) - slowness));
         addHeader(dltRecord, "plurima-dlt-attempt-count", String.valueOf(effectiveAttempt));
         addHeader(dltRecord, "plurima-dlt-routed-at", Instant.now().toString());
         if (config.includeStackTrace()) {

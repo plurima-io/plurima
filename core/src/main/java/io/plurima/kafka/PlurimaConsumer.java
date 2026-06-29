@@ -68,6 +68,8 @@ public final class PlurimaConsumer<K, V> implements AutoCloseable {
     private final Duration shutdownDrainTimeout;
     private final PlurimaMetrics metrics;
     private final AdaptiveBarrierConfig adaptiveBarrierConfig; // nullable; null = disabled
+    private final boolean lockDurationExplicitlySet;
+    private final Duration handlerTimeout; // nullable; null = no per-handler timeout
 
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -102,7 +104,9 @@ public final class PlurimaConsumer<K, V> implements AutoCloseable {
         Duration lockDuration,
         Duration shutdownDrainTimeout,
         PlurimaMetrics metrics,
-        AdaptiveBarrierConfig adaptiveBarrierConfig) {
+        AdaptiveBarrierConfig adaptiveBarrierConfig,
+        boolean lockDurationExplicitlySet,
+        Duration handlerTimeout) {
         this.kafkaProperties = kafkaProperties;
         this.topic = topic;
         this.listener = listener;
@@ -122,6 +126,8 @@ public final class PlurimaConsumer<K, V> implements AutoCloseable {
         this.shutdownDrainTimeout = shutdownDrainTimeout;
         this.metrics = metrics;
         this.adaptiveBarrierConfig = adaptiveBarrierConfig;
+        this.lockDurationExplicitlySet = lockDurationExplicitlySet;
+        this.handlerTimeout = handlerTimeout;
     }
 
     public static <K, V> PlurimaConsumerBuilder<K, V> builder() {
@@ -167,7 +173,9 @@ public final class PlurimaConsumer<K, V> implements AutoCloseable {
                 lockDuration,
                 shutdownDrainTimeout,
                 metrics,
-                adaptiveBarrierConfig);
+                adaptiveBarrierConfig,
+                lockDurationExplicitlySet,
+                handlerTimeout);
             case CLASSIC_BASIC -> {
                 yield new ClassicBasicRuntime<>(
                     kafkaProperties,

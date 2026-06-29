@@ -17,13 +17,13 @@ tasks.register("benchmark") {
 allprojects {
     group = "io.plurima"
     // master branch carries the NEXT version as -SNAPSHOT. To cut a release:
-    //   1. checkout the release branch, change to e.g. "0.1.0" (no suffix),
-    //   2. tag v0.1.0 and push the tag — release.yml verifies tag matches version
+    //   1. checkout the release branch, change to e.g. "0.2.0" (no suffix),
+    //   2. tag v0.2.0 and push the tag — release.yml verifies tag matches version
     //      and publishes to Sonatype releases
     //   3. bump back to 0.1.1-SNAPSHOT on master
     // The ci.yml publish-snapshot job refuses non-SNAPSHOT versions as a hard guard
     // (so a misconfigured branch on master cannot accidentally publish a real release).
-    version = "0.1.0"
+    version = "0.2.0"
 }
 
 subprojects {

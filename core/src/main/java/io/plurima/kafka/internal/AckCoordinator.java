@@ -14,6 +14,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 @Internal
@@ -24,25 +25,57 @@ public final class AckCoordinator implements AcknowledgementCommitCallback {
     private final Queue<AckRequest> pending = new ConcurrentLinkedQueue<>();
     private final InFlightRegistry registry;
     private final PlurimaMetrics metrics;
+    private final SlownessReleaseTracker slownessTracker; // nullable — null = not tracked
+    /**
+     * Coords whose terminal ACCEPT/REJECT has been queued but whose broker commit has not yet
+     * been confirmed. Their slowness count is cleared only once {@link #onComplete} reports the
+     * commit succeeded — NOT at queue time — so that if the terminal ack/commit fails and the
+     * record is redelivered, the redelivery still benefits from the earlier slowness subtraction
+     * (and is not prematurely exhausted/DLT'd). Empty/unused when {@code slownessTracker} is null.
+     */
+    private final Set<RecordCoord> pendingSlownessClear = ConcurrentHashMap.newKeySet();
 
     public AckCoordinator(InFlightRegistry registry) {
-        this(registry, PlurimaMetrics.noOp());
+        this(registry, PlurimaMetrics.noOp(), null);
     }
 
     public AckCoordinator(InFlightRegistry registry, PlurimaMetrics metrics) {
+        this(registry, metrics, null);
+    }
+
+    public AckCoordinator(InFlightRegistry registry, PlurimaMetrics metrics,
+                          SlownessReleaseTracker slownessTracker) {
         this.registry = registry;
         this.metrics = metrics;
+        this.slownessTracker = slownessTracker;
     }
 
     @Override
     public void onComplete(Map<TopicIdPartition, Set<Long>> offsets, Exception exception) {
-        if (exception == null) {
-            return;
+        // Resolve slowness-clear marks for the offsets in this commit. The mark is consumed
+        // (removed) either way, but the tracker is cleared ONLY on commit success:
+        //  - success → the terminal ack durably landed; forget the slowness count.
+        //  - failure → the record will be redelivered; KEEP the count, but still drop the mark so a
+        //    later non-terminal (RELEASE) commit of the same coord can't spuriously clear it later.
+        // Only terminal acks (ACCEPT/REJECT) are ever in the set — RELEASEs are never marked, so a
+        // committed RELEASE never matches and its count survives for the redelivery.
+        if (slownessTracker != null && !pendingSlownessClear.isEmpty()) {
+            for (var e : offsets.entrySet()) {
+                String topic = e.getKey().topicPartition().topic();
+                int partition = e.getKey().topicPartition().partition();
+                for (Long offset : e.getValue()) {
+                    RecordCoord coord = new RecordCoord(topic, partition, offset);
+                    if (pendingSlownessClear.remove(coord) && exception == null) {
+                        slownessTracker.clear(coord);
+                    }
+                }
+            }
         }
-        for (TopicIdPartition tip : offsets.keySet()) {
-            String topic = tip.topicPartition().topic();
-            log.warn("Async commit failed for partition {}: {}", tip, exception.getMessage());
-            metrics.ackCommitFailed(topic, exception.getClass().getSimpleName());
+        if (exception != null) {
+            for (TopicIdPartition tip : offsets.keySet()) {
+                log.warn("Async commit failed for partition {}: {}", tip, exception.getMessage());
+                metrics.ackCommitFailed(tip.topicPartition().topic(), exception.getClass().getSimpleName());
+            }
         }
     }
 
@@ -75,6 +108,33 @@ public final class AckCoordinator implements AcknowledgementCommitCallback {
         // success path fired this metric, so manual-ack ACCEPT/REJECT and ListenerInvoker's
         // auto-RELEASE-on-no-ack were invisible.
         metrics.recordsProcessed(r.coord().topic(), type.name().toLowerCase(Locale.ROOT));
+        // Terminal outcome (ACCEPT/REJECT) → the coord will be done once its commit confirms. Mark
+        // it for slowness-clear, but DON'T clear yet: the clear happens in onComplete on commit
+        // success, so a failed commit (record redelivered) keeps its slowness subtraction. RELEASE
+        // is non-terminal — never marked, so its count survives for the redelivery.
+        if (slownessTracker != null
+            && (type == AcknowledgeType.ACCEPT || type == AcknowledgeType.REJECT)) {
+            pendingSlownessClear.add(r.coord());
+        }
+    }
+
+    /**
+     * RELEASE a record because its handler was too slow (drain-barrier / shutdown force-RELEASE),
+     * recording the release as <em>slowness</em> rather than failure so {@link RetryEngine} does
+     * not count the resulting broker redelivery toward retry exhaustion. Used only by
+     * {@link PollLoop#forceReleaseStuckRecords()}; failure-driven retries go through
+     * {@link #queueAck} with {@code RELEASE} and are (correctly) NOT recorded here.
+     *
+     * <p>The slowness count is recorded optimistically before the first-wins guard in
+     * {@code queueAck}; if the RELEASE is dropped (the worker won the race with a terminal ACCEPT),
+     * the record completes successfully and its stale count is never read again (and is evicted by
+     * the tracker's cap) — harmless, and erring on the safe side (never toward premature DLT).
+     */
+    public void queueReleaseForSlowness(InFlightRecord<?, ?> r) {
+        if (slownessTracker != null) {
+            slownessTracker.recordRelease(r.coord());
+        }
+        queueAck(r, AcknowledgeType.RELEASE);
     }
 
     /**
@@ -112,6 +172,7 @@ public final class AckCoordinator implements AcknowledgementCommitCallback {
                 // identity-aware complete race.
                 log.warn("Acknowledge failed (lease expired) for {}: {}",
                     req.coord(), e.getMessage());
+                dropPendingSlownessClear(req);
                 registry.complete(req.record());
             } catch (IllegalStateException e) {
                 // The record is no longer in the consumer's current batch — most commonly
@@ -121,11 +182,24 @@ public final class AckCoordinator implements AcknowledgementCommitCallback {
                 // to the share group; redelivery handles it. Swallow + continue.
                 log.warn("Acknowledge dropped (record not waiting — likely after force-RELEASE) for {}: {}",
                     req.coord(), e.getMessage());
+                dropPendingSlownessClear(req);
                 registry.complete(req.record());
             }
         }
         if (anyDrained) {
             consumer.commitAsync();
+        }
+    }
+
+    /**
+     * The terminal ack for {@code req} never reached the broker (lease expired / record not
+     * waiting), so drop its slowness-clear mark — otherwise a later successful commit of the same
+     * (redelivered) coord could spuriously clear a still-live slowness count. No-op for
+     * non-terminal (RELEASE) acks, which are never marked.
+     */
+    private void dropPendingSlownessClear(AckRequest req) {
+        if (slownessTracker != null) {
+            pendingSlownessClear.remove(req.coord());
         }
     }
 }

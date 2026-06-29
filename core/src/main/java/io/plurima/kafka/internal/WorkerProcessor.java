@@ -1,6 +1,7 @@
 package io.plurima.kafka.internal;
 
 import io.plurima.kafka.ConsumerContext;
+import io.plurima.kafka.HandlerTimeoutException;
 import io.plurima.kafka.annotation.Internal;
 import io.plurima.kafka.metrics.PlurimaMetrics;
 import io.plurima.kafka.retry.RetryDecision;
@@ -9,7 +10,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Internal
 public final class WorkerProcessor {
@@ -22,6 +26,8 @@ public final class WorkerProcessor {
     private final DltRouter dltRouter; // nullable
     private final PlurimaMetrics metrics;
     private final HandlerLatencyWindow latencyWindow; // nullable — adaptive barrier off when null
+    private final Duration handlerTimeout;            // nullable — no timeout when null
+    private final ScheduledExecutorService timeoutScheduler; // nullable — paired with handlerTimeout
 
     /** Constructor without DLT support. */
     public WorkerProcessor(
@@ -50,7 +56,7 @@ public final class WorkerProcessor {
         this(invoker, retryEngine, coordinator, dltRouter, metrics, null);
     }
 
-    /** Full constructor including the adaptive-barrier latency window (nullable). */
+    /** Constructor including the adaptive-barrier latency window (nullable); no handler timeout. */
     public WorkerProcessor(
         ListenerInvoker invoker,
         RetryEngine retryEngine,
@@ -58,12 +64,27 @@ public final class WorkerProcessor {
         DltRouter dltRouter,
         PlurimaMetrics metrics,
         HandlerLatencyWindow latencyWindow) {
+        this(invoker, retryEngine, coordinator, dltRouter, metrics, latencyWindow, null, null);
+    }
+
+    /** Full constructor including the optional handler timeout + its watchdog scheduler. */
+    public WorkerProcessor(
+        ListenerInvoker invoker,
+        RetryEngine retryEngine,
+        AckCoordinator coordinator,
+        DltRouter dltRouter,
+        PlurimaMetrics metrics,
+        HandlerLatencyWindow latencyWindow,
+        Duration handlerTimeout,
+        ScheduledExecutorService timeoutScheduler) {
         this.invoker = invoker;
         this.retryEngine = retryEngine;
         this.coordinator = coordinator;
         this.dltRouter = dltRouter;
         this.metrics = metrics;
         this.latencyWindow = latencyWindow;
+        this.handlerTimeout = handlerTimeout;
+        this.timeoutScheduler = timeoutScheduler;
     }
 
     public void process(InFlightRecord<byte[], byte[]> r, ConsumerContext ctx) {
@@ -93,6 +114,8 @@ public final class WorkerProcessor {
      */
     private Throwable invokeListener(InFlightRecord<byte[], byte[]> r, ConsumerContext ctx) {
         long startNanos = System.nanoTime();
+        AtomicBoolean firedTimeout = new AtomicBoolean(false);
+        ScheduledFuture<?> watchdog = scheduleTimeout(firedTimeout);
         try {
             invoker.invoke(r, ctx, coordinator);
             long elapsed = System.nanoTime() - startNanos;
@@ -108,9 +131,38 @@ public final class WorkerProcessor {
         } catch (Throwable t) {
             metrics.recordProcessDuration(r.coord().topic(),
                 Duration.ofNanos(System.nanoTime() - startNanos));
-            metrics.recordsFailed(r.coord().topic(), t.getClass().getName());
-            return t;
+            // If our watchdog interrupted the handler, surface it as HandlerTimeoutException so
+            // the user's RetryPolicy can classify timeouts explicitly. Otherwise pass the cause through.
+            Throwable cause = firedTimeout.get()
+                ? new HandlerTimeoutException("handler exceeded timeout " + handlerTimeout, t)
+                : t;
+            metrics.recordsFailed(r.coord().topic(), cause.getClass().getName());
+            return cause;
+        } finally {
+            if (watchdog != null) {
+                watchdog.cancel(false);
+                // Consume ONLY our watchdog's interrupt (so a stray timeout interrupt can't leak
+                // into a later retry sleep). Crucially, do NOT clear when the watchdog did not fire:
+                // a non-timeout interrupt (e.g. shutdown interrupting the worker) must survive so
+                // retryAfter()'s Thread.sleep aborts instead of sleeping/retrying through shutdown.
+                if (firedTimeout.get()) {
+                    Thread.interrupted();
+                }
+            }
         }
+    }
+
+    /**
+     * Schedules an interrupt of the current worker thread after {@code handlerTimeout}, recording
+     * that it fired via {@code firedTimeout}. Returns {@code null} when no timeout is configured.
+     */
+    private ScheduledFuture<?> scheduleTimeout(AtomicBoolean firedTimeout) {
+        if (handlerTimeout == null || timeoutScheduler == null) return null;
+        Thread worker = Thread.currentThread();
+        return timeoutScheduler.schedule(() -> {
+            firedTimeout.set(true);
+            worker.interrupt();
+        }, handlerTimeout.toNanos(), TimeUnit.NANOSECONDS);
     }
 
     /**

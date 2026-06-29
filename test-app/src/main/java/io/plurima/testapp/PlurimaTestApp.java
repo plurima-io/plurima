@@ -10,17 +10,20 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * End-to-end smoke / proof app for Plurima. Exercises the features added in v0.1
@@ -48,6 +51,23 @@ public final class PlurimaTestApp {
         report.runScenario("share-unordered-roundtrip",
             "SHARE + UNORDERED: 50 records produce → consume",
             () -> scenarioShareUnordered(h));
+
+        // --- Tier-2 Message API + P1/P2/P3 (real-life usage) ---
+        report.runScenario("share-onmessage-roundtrip",
+            "SHARE + onMessage: Message-based auto-ack handler; value+key+header surface correctly",
+            () -> scenarioShareOnMessage(h));
+
+        report.runScenario("share-onmessage-ack-explicit",
+            "SHARE + onMessageAck: explicit accept() per record completes each exactly once",
+            () -> scenarioShareOnMessageAck(h));
+
+        report.runScenario("share-handler-timeout",
+            "P3: handlerTimeout interrupts a blocked handler; record is not reprocessed forever",
+            () -> scenarioShareHandlerTimeout(h));
+
+        report.runScenario("share-high-volume-real-traffic",
+            "Real traffic: 5000 records / 4 partitions / concurrency=64 → no loss, throughput report",
+            () -> scenarioShareHighVolume(h));
 
         report.runScenario("share-key-rejected-at-build",
             "G1: SHARE + KEY combination must throw IllegalArgumentException at build()",
@@ -909,6 +929,178 @@ public final class PlurimaTestApp {
         }
         System.out.println("    verified: " + total + " records arrived as typed Strings "
             + "(non-identity deserialize path)");
+    }
+
+    // ====================================================================================
+    // Tier-2 Message API + P1/P2/P3 scenarios (real-life usage)
+    // ====================================================================================
+
+    private static void scenarioShareOnMessage(Helpers h) throws Exception {
+        String topic = h.createUniqueTopic("plurima-app-onmsg", 1);
+        String groupId = "plurima-app-onmsg-" + UUID.randomUUID();
+        int total = 50;
+        Set<String> values = ConcurrentHashMap.newKeySet();
+        AtomicInteger maxDeliveryCount = new AtomicInteger();
+        AtomicReference<String> header = new AtomicReference<>();
+        CountDownLatch done = new CountDownLatch(total);
+
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+                .kafkaProperties(h.shareConsumerProps(groupId))
+                .topic(topic)
+                .engine(ConsumerEngine.SHARE)
+                .ordering(OrderingMode.UNORDERED)
+                .concurrency(8)
+                .pollTimeout(Duration.ofMillis(200))
+                .onMessage(msg -> {
+                    values.add(new String(msg.value(), StandardCharsets.UTF_8));
+                    maxDeliveryCount.accumulateAndGet(msg.deliveryCount(), Math::max);
+                    msg.header("src").ifPresent(b -> header.set(new String(b, StandardCharsets.UTF_8)));
+                    done.countDown();
+                })
+                .build()) {
+            c.start();
+            h.waitForShareAssignment(groupId, topic);
+            try (var producer = h.byteProducer()) {
+                for (int i = 0; i < total; i++) {
+                    ProducerRecord<byte[], byte[]> pr = new ProducerRecord<>(
+                        topic, ("k" + i).getBytes(), ("v" + i).getBytes());
+                    pr.headers().add("src", "app".getBytes());
+                    producer.send(pr).get();
+                }
+            }
+            if (!done.await(45, TimeUnit.SECONDS)) {
+                throw new AssertionError("only " + values.size() + "/" + total + " received");
+            }
+        } finally {
+            h.deleteTopicQuietly(topic);
+        }
+        assertEquals(total, values.size(), "share-onmessage distinct values");
+        assertEquals(1, maxDeliveryCount.get(), "share-onmessage first delivery (deliveryCount)");
+        if (!"app".equals(header.get())) {
+            throw new AssertionError("header not surfaced through Message: " + header.get());
+        }
+        System.out.println("    verified: 50 records via onMessage; value/header/deliveryCount correct");
+    }
+
+    private static void scenarioShareOnMessageAck(Helpers h) throws Exception {
+        String topic = h.createUniqueTopic("plurima-app-onmsgack", 1);
+        String groupId = "plurima-app-onmsgack-" + UUID.randomUUID();
+        int total = 30;
+        Set<String> values = ConcurrentHashMap.newKeySet();
+        AtomicInteger invocations = new AtomicInteger();
+        CountDownLatch done = new CountDownLatch(total);
+
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+                .kafkaProperties(h.shareConsumerProps(groupId))
+                .topic(topic)
+                .engine(ConsumerEngine.SHARE)
+                .ordering(OrderingMode.UNORDERED)
+                .concurrency(8)
+                .pollTimeout(Duration.ofMillis(200))
+                .onMessageAck(msg -> {
+                    invocations.incrementAndGet();
+                    if (values.add(new String(msg.value(), StandardCharsets.UTF_8))) done.countDown();
+                    msg.accept();
+                })
+                .build()) {
+            c.start();
+            h.waitForShareAssignment(groupId, topic);
+            try (var producer = h.byteProducer()) {
+                for (int i = 0; i < total; i++) {
+                    producer.send(new ProducerRecord<>(topic,
+                        ("k" + i).getBytes(), ("v" + i).getBytes())).get();
+                }
+            }
+            if (!done.await(45, TimeUnit.SECONDS)) {
+                throw new AssertionError("only " + values.size() + "/" + total + " received");
+            }
+        } finally {
+            h.deleteTopicQuietly(topic);
+        }
+        assertEquals(total, values.size(), "share-onmessage-ack distinct values");
+        System.out.println("    verified: 30 records via onMessageAck accept(); invocations=" + invocations.get());
+    }
+
+    private static void scenarioShareHandlerTimeout(Helpers h) throws Exception {
+        String topic = h.createUniqueTopic("plurima-app-htimeout", 1);
+        String groupId = "plurima-app-htimeout-" + UUID.randomUUID();
+        AtomicInteger invocations = new AtomicInteger();
+        CountDownLatch first = new CountDownLatch(1);
+
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+                .kafkaProperties(h.shareConsumerProps(groupId))
+                .topic(topic)
+                .engine(ConsumerEngine.SHARE)
+                .ordering(OrderingMode.UNORDERED)
+                .concurrency(4)
+                .pollTimeout(Duration.ofMillis(200))
+                .handlerTimeout(Duration.ofSeconds(1))
+                .onMessage(msg -> {
+                    invocations.incrementAndGet();
+                    first.countDown();
+                    Thread.sleep(30_000);   // blocks past the timeout; interruptible
+                })
+                .build()) {
+            c.start();
+            h.waitForShareAssignment(groupId, topic);
+            try (var producer = h.byteProducer()) {
+                producer.send(new ProducerRecord<>(topic, "k".getBytes(), "v".getBytes())).get();
+            }
+            if (!first.await(20, TimeUnit.SECONDS)) {
+                throw new AssertionError("handler was never invoked");
+            }
+            Thread.sleep(6_000);   // let any reprocessing surface
+            if (invocations.get() > 2) {
+                throw new AssertionError("record reprocessed too many times: " + invocations.get());
+            }
+        } finally {
+            h.deleteTopicQuietly(topic);
+        }
+        System.out.println("    verified: blocked handler interrupted at timeout, not looping "
+            + "(invocations=" + invocations.get() + ")");
+    }
+
+    private static void scenarioShareHighVolume(Helpers h) throws Exception {
+        String topic = h.createUniqueTopic("plurima-app-hv", 4);
+        String groupId = "plurima-app-hv-" + UUID.randomUUID();
+        int total = 5000;
+        Set<String> values = ConcurrentHashMap.newKeySet();
+        AtomicInteger invocations = new AtomicInteger();
+        CountDownLatch done = new CountDownLatch(total);
+
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+                .kafkaProperties(h.shareConsumerProps(groupId))
+                .topic(topic)
+                .engine(ConsumerEngine.SHARE)
+                .ordering(OrderingMode.UNORDERED)
+                .concurrency(64)
+                .pollTimeout(Duration.ofMillis(200))
+                .onMessage(msg -> {
+                    invocations.incrementAndGet();
+                    if (values.add(new String(msg.value(), StandardCharsets.UTF_8))) done.countDown();
+                })
+                .build()) {
+            c.start();
+            h.waitForShareAssignment(groupId, topic);
+            long startNanos = System.nanoTime();
+            try (var producer = h.byteProducer()) {
+                for (int i = 0; i < total; i++) {
+                    producer.send(new ProducerRecord<>(topic,
+                        ("k" + (i % 500)).getBytes(), ("v" + i).getBytes()));
+                }
+                producer.flush();
+            }
+            if (!done.await(120, TimeUnit.SECONDS)) {
+                throw new AssertionError("only " + values.size() + "/" + total + " processed");
+            }
+            long ms = (System.nanoTime() - startNanos) / 1_000_000L;
+            double rps = total * 1000.0 / Math.max(1, ms);
+            System.out.printf("    processed %d/%d in %d ms (%.0f rec/s); invocations=%d (dups=%d)%n",
+                values.size(), total, ms, rps, invocations.get(), invocations.get() - total);
+        } finally {
+            h.deleteTopicQuietly(topic);
+        }
+        assertEquals(total, values.size(), "share-high-volume no loss");
     }
 
     // ====================================================================================

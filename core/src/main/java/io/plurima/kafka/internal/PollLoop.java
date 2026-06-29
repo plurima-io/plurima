@@ -33,7 +33,18 @@ public final class PollLoop implements Runnable, AutoCloseable {
     private final Duration pollTimeout;
     private final Duration lockDuration;
     private final Duration shutdownDrainTimeout;
-    private final Duration barrierTimeout;
+    /**
+     * Drain-barrier / force-RELEASE deadline. Volatile because {@link #compareLockDurationOnce}
+     * may auto-align it to the broker lock once discovered (P1), and the gauge reader on another
+     * thread observes it via {@link #effectiveBarrierMillis}.
+     */
+    private volatile Duration barrierTimeout;
+    /**
+     * Whether the user explicitly set {@code .lockDuration(...)}. When false, the barrier is
+     * auto-aligned to 0.8 × the broker's record-lock duration once known, maximizing the
+     * no-force-release zone the broker permits.
+     */
+    private final boolean lockDurationExplicitlySet;
     private final PlurimaMetrics metrics;
     private final String boundTopic;
     /**
@@ -121,7 +132,7 @@ public final class PollLoop implements Runnable, AutoCloseable {
             onLoopExit, null, null);
     }
 
-    /** Full constructor with all parameters including the adaptive-barrier window + config. */
+    /** Constructor with adaptive-barrier window + config; treats lockDuration as explicit. */
     public PollLoop(
         ShareConsumer<byte[], byte[]> consumer,
         WorkDispatcher dispatcher,
@@ -137,6 +148,28 @@ public final class PollLoop implements Runnable, AutoCloseable {
         Runnable onLoopExit,
         HandlerLatencyWindow latencyWindow,
         AdaptiveBarrierConfig adaptiveConfig) {
+        this(consumer, dispatcher, coordinator, registry, gate,
+            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, boundTopic,
+            onLoopExit, latencyWindow, adaptiveConfig, true);
+    }
+
+    /** Full constructor including whether lockDuration was set explicitly (P1 auto-alignment). */
+    public PollLoop(
+        ShareConsumer<byte[], byte[]> consumer,
+        WorkDispatcher dispatcher,
+        AckCoordinator coordinator,
+        InFlightRegistry registry,
+        BackpressureGate gate,
+        Duration pollTimeout,
+        Duration lockDuration,
+        Duration shutdownDrainTimeout,
+        Duration barrierTimeout,
+        PlurimaMetrics metrics,
+        String boundTopic,
+        Runnable onLoopExit,
+        HandlerLatencyWindow latencyWindow,
+        AdaptiveBarrierConfig adaptiveConfig,
+        boolean lockDurationExplicitlySet) {
         this.consumer = consumer;
         this.dispatcher = dispatcher;
         this.coordinator = coordinator;
@@ -146,6 +179,7 @@ public final class PollLoop implements Runnable, AutoCloseable {
         this.lockDuration = lockDuration;
         this.shutdownDrainTimeout = shutdownDrainTimeout;
         this.barrierTimeout = barrierTimeout;
+        this.lockDurationExplicitlySet = lockDurationExplicitlySet;
         this.metrics = metrics;
         this.boundTopic = boundTopic;
         this.onLoopExit = onLoopExit;
@@ -255,6 +289,20 @@ public final class PollLoop implements Runnable, AutoCloseable {
     private void compareLockDurationOnce() {
         if (localLockComparedOnce || brokerLockDuration.isEmpty()) return;
         Duration broker = brokerLockDuration.get();
+        if (!lockDurationExplicitlySet) {
+            // P1: auto-align the force-RELEASE deadline to 0.8 × the broker's record-lock
+            // duration. This maximizes the window in which a slow-but-healthy handler is left
+            // alone (no force-RELEASE → no redelivery → no duplicate), bounded safely below the
+            // broker's own expiry. Only when the user did NOT set .lockDuration(...) explicitly.
+            Duration aligned = Duration.ofMillis((long) (broker.toMillis() * 0.8));
+            barrierTimeout = aligned;
+            effectiveBarrierMillis = aligned.toMillis();
+            log.info("Auto-aligned drain barrier to {} (0.8 × broker "
+                + "group.share.record.lock.duration.ms={}). Call .lockDuration(...) to override.",
+                aligned, broker);
+            localLockComparedOnce = true;
+            return;
+        }
         if (lockDuration.compareTo(broker) >= 0) {
             log.error("Plurima's local lockDuration={} is NOT smaller than the broker's "
                 + "group.share.record.lock.duration.ms={}. The broker will redeliver "
@@ -412,7 +460,9 @@ public final class PollLoop implements Runnable, AutoCloseable {
         if (stuck.isEmpty()) return;
         log.warn("Drain barrier timed out with {} record(s) in flight; force-RELEASE", stuck.size());
         for (var r : stuck) {
-            coordinator.queueAck(r, org.apache.kafka.clients.consumer.AcknowledgeType.RELEASE);
+            // Record as a SLOWNESS release (not a failure) so the broker redelivery this triggers
+            // is not counted toward retry exhaustion / DLT routing by RetryEngine.
+            coordinator.queueReleaseForSlowness(r);
             // From Plurima's perspective we have ABANDONED this record: RELEASE goes to the broker,
             // which may redeliver it on the next poll. Identity-aware complete() removes ONLY if
             // this exact InFlightRecord is still registered (it should be — we just read it from
