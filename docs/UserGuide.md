@@ -1,6 +1,6 @@
 # Plurima - User Guide
 
-> A production-grade abstraction over `KafkaShareConsumer` (KIP-932) and vanilla `KafkaConsumer`. Per-key ordering with intra-partition parallelism, exponential retry, dead-letter routing, and Spring Boot integration.
+> A production-grade abstraction over `KafkaShareConsumer` (KIP-932) and vanilla `KafkaConsumer`. Share-group fan-out, classic per-key ordering with intra-partition parallelism, exponential retry, dead-letter routing, and Spring Boot integration.
 
 **Status:** v0.2.0 — adds the `Message` handler API, handler timeouts, lock-duration auto-alignment, and slowness-aware retry budgeting.
 
@@ -232,6 +232,9 @@ code does not need Kafka client types.
 `RecordListener`: normal return ACCEPTs the record; throwing routes through retry/DLT.
 
 ```java
+import io.plurima.kafka.Message;
+import io.plurima.kafka.MessageListener;
+
 class OrderHandler implements MessageListener<String, Order> {
     private final OrderService service;
 
@@ -277,6 +280,9 @@ A return without acking auto-RELEASEs, same as `ManualAckListener`.
 **Testing.** Build a `Message` with no broker via `Messages` and call your handler directly:
 
 ```java
+import io.plurima.kafka.Message;
+import io.plurima.kafka.Messages;
+
 new OrderHandler(orderService).onMessage(Messages.of("k1", order));
 
 Message<String, Order> retryMessage = Messages.builder("k1", order)
@@ -591,6 +597,11 @@ This is automatic; no configuration is required.
 `.handlerTimeout(Duration)`. When a listener exceeds it, its worker thread is
 interrupted and the failure is routed through retry/DLT as a
 `HandlerTimeoutException`:
+
+```java
+import io.plurima.kafka.HandlerTimeoutException;
+import io.plurima.kafka.retry.RetryPolicy;
+```
 
 ```java
 .handlerTimeout(Duration.ofSeconds(30))

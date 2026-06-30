@@ -34,6 +34,8 @@ Plurima packages those concerns into a small library surface:
   and safe commit-frontier tracking for classic groups.
 - **Retry and DLT**: exponential retry policy, delayed retry via broker redelivery,
   and configurable dead-letter topic publishing.
+- **Application-friendly handlers**: Kafka-decoupled `Message<K,V>` APIs for
+  handlers that should be easy to test without a broker.
 - **Operational visibility**: built-in metrics SPI plus Micrometer adapter.
 - **Spring Boot starter**: annotation-driven listeners and property binding.
 
@@ -59,8 +61,7 @@ See [Benchmark Results](docs/Benchmarks.md) for methodology, raw output, limitat
 and scenario details. These figures are from one local run and are not a general
 performance guarantee.
 
-The benchmark implementation is included in this repository. Run it against a
-local Kafka broker with:
+From a source checkout, run the benchmark against a local Kafka broker with:
 
 ```bash
 ./gradlew benchmark
@@ -140,6 +141,22 @@ try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>
     consumer.start();
     Thread.currentThread().join();
 }
+```
+
+For application code that should not depend on Kafka client types, prefer the
+`Message` API:
+
+```java
+import io.plurima.kafka.Message;
+import io.plurima.kafka.PlurimaConsumer;
+
+PlurimaConsumer.<String, Order>builder()
+    .kafkaProperties(props)
+    .topic("orders")
+    .onMessage((Message<String, Order> msg) -> {
+        handleOrder(msg.key(), msg.value());
+    })
+    .build();
 ```
 
 ### Classic Engine With Per-Key FIFO
@@ -263,7 +280,7 @@ Apache License 2.0. See [LICENSE](LICENSE).
 ## Trademark Notice
 
 KAFKA is a registered trademark of The Apache Software Foundation and has been
-licensed for use by plurima. plurima has no affiliation with and is not endorsed
+licensed for use by Plurima. Plurima has no affiliation with and is not endorsed
 by The Apache Software Foundation.
 
 See the [Apache Kafka trademark guidance](https://kafka.apache.org/community/trademark/).
