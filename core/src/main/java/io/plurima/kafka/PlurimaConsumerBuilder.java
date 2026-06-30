@@ -1,6 +1,7 @@
 package io.plurima.kafka;
 
 import io.plurima.kafka.ack.ManualAckListener;
+import io.plurima.kafka.ack.MessageAckListener;
 import io.plurima.kafka.annotation.Stable;
 import io.plurima.kafka.deserializer.RecordDeserializer;
 import io.plurima.kafka.dlt.DltConfig;
@@ -65,6 +66,8 @@ public final class PlurimaConsumerBuilder<K, V> {
     private RecordDeserializer<V> valueDeserializer =
         (RecordDeserializer<V>) RecordDeserializer.bytes();
     private ManualAckListener<K, V> manualAckListener;
+    /** Guards "exactly one handler" — set by any of listener/manualAckListener/onMessage/onMessageAck. */
+    private boolean handlerConfigured = false;
     private ConsumerEngine engine = ConsumerEngine.SHARE;
     private OrderingGuarantee orderingGuarantee;  // null = infer from engine + ordering
     private OrderingMode ordering = OrderingMode.UNORDERED;
@@ -72,11 +75,13 @@ public final class PlurimaConsumerBuilder<K, V> {
     private boolean concurrencyExplicitlySet = false;
     private Duration pollTimeout = Duration.ofSeconds(1);
     private Duration lockDuration = Duration.ofSeconds(30);
+    private boolean lockDurationExplicitlySet = false;
     private Duration shutdownDrainTimeout = Duration.ofSeconds(30);
     private int shardCount = -1; // -1 means "derive from concurrency × 4 at build time"
     private RetryPolicy retryPolicy = RetryPolicy.noRetry();
     private DltConfig dltConfig; // null = no DLT (retry exhaustion → REJECT with error log)
     private AdaptiveBarrierConfig adaptiveBarrierConfig; // null = disabled
+    private Duration handlerTimeout; // null = no per-handler timeout
     private PlurimaMetrics metrics = PlurimaMetrics.noOp();
 
     PlurimaConsumerBuilder() {}
@@ -91,7 +96,22 @@ public final class PlurimaConsumerBuilder<K, V> {
         this.topic = topic; return this;
     }
 
+    /**
+     * Rejects configuring more than one handler. Exactly one of {@code listener},
+     * {@code manualAckListener}, {@code onMessage}, or {@code onMessageAck} may be set.
+     */
+    private void markHandlerConfigured() {
+        if (handlerConfigured) {
+            throw new IllegalStateException(
+                "a handler is already configured — set exactly one of listener(...), "
+                + "manualAckListener(...), onMessage(...), or onMessageAck(...)");
+        }
+        handlerConfigured = true;
+    }
+
     public PlurimaConsumerBuilder<K, V> listener(RecordListener<K, V> listener) {
+        Objects.requireNonNull(listener, "listener");
+        markHandlerConfigured();
         this.listener = listener; return this;
     }
 
@@ -106,7 +126,38 @@ public final class PlurimaConsumerBuilder<K, V> {
     }
 
     public PlurimaConsumerBuilder<K, V> manualAckListener(ManualAckListener<K, V> listener) {
-        this.manualAckListener = Objects.requireNonNull(listener, "manualAckListener");
+        Objects.requireNonNull(listener, "manualAckListener");
+        markHandlerConfigured();
+        this.manualAckListener = listener;
+        return this;
+    }
+
+    /**
+     * Auto-ack listener over a {@link Message} — the recommended default for application
+     * handlers. The handler receives a single Kafka-decoupled object (payload + metadata);
+     * a normal return ACCEPTs the record, a thrown exception goes to the retry/DLT pipeline.
+     * Adapts onto the standard {@link RecordListener}, so retry, DLT, slowness handling, and
+     * the handler timeout all apply unchanged.
+     */
+    public PlurimaConsumerBuilder<K, V> onMessage(MessageListener<K, V> listener) {
+        Objects.requireNonNull(listener, "messageListener");
+        markHandlerConfigured();
+        this.listener = (record, ctx) ->
+            listener.onMessage(new RecordMessage<>(record, ctx.deliveryCount(), ctx.orderingMode()));
+        return this;
+    }
+
+    /**
+     * Explicit-ack listener over an {@link io.plurima.kafka.ack.AckMessage} — payload, metadata, and ack on one
+     * object. The handler must call {@code acknowledge(...)} / {@code accept()} / {@code release()}
+     * / {@code reject()} (a return without acking auto-RELEASEs). Adapts onto
+     * {@link ManualAckListener}.
+     */
+    public PlurimaConsumerBuilder<K, V> onMessageAck(MessageAckListener<K, V> listener) {
+        Objects.requireNonNull(listener, "messageAckListener");
+        markHandlerConfigured();
+        this.manualAckListener = (record, ack) ->
+            listener.onMessage(new AckRecordMessage<>(record, ack));
         return this;
     }
 
@@ -160,14 +211,16 @@ public final class PlurimaConsumerBuilder<K, V> {
      * to another consumer (or back to us on the next poll) instead of waiting for its
      * own acquisition-lock expiry.
      *
-     * <p><b>Set this BELOW</b> the broker's {@code group.share.record.lock.duration.ms}
-     * — typically ~80% of it. The point is to beat the broker's expiry, so a value
-     * equal to or larger than the broker's gives no early-recovery benefit and Plurima
-     * logs an error at startup once the broker reports its real value (queried via
-     * {@code KafkaShareConsumer.acquisitionLockTimeoutMs}).
+     * <p>If this method is not called, Plurima auto-aligns the force-RELEASE deadline
+     * to roughly 80% of the broker's {@code group.share.record.lock.duration.ms} once
+     * the broker reports it. This keeps the no-force-release window as large as the
+     * broker safely allows. Calling this method disables auto-alignment and uses the
+     * supplied value verbatim.
      *
-     * <p>Default 30 s. The broker's default is 30 s in some Kafka 4.x builds and 60 s in
-     * others; check your broker config before relying on the default.
+     * <p>When setting this explicitly, set it BELOW the broker lock — typically ~80% of
+     * it. A value equal to or larger than the broker's gives no early-recovery benefit
+     * and Plurima logs an error at startup once the broker reports its real value
+     * (queried via {@code KafkaShareConsumer.acquisitionLockTimeoutMs}).
      *
      * <p>Has no effect on the {@code CLASSIC_BASIC} engine — classic consumer groups
      * have no per-record lease. The classic poll loop heartbeats every iteration
@@ -181,6 +234,7 @@ public final class PlurimaConsumerBuilder<K, V> {
             throw new IllegalArgumentException("lockDuration must be > 0, was " + t);
         }
         this.lockDuration = t;
+        this.lockDurationExplicitlySet = true;
         return this;
     }
 
@@ -218,6 +272,22 @@ public final class PlurimaConsumerBuilder<K, V> {
     /** Enable the SHARE-engine adaptive drain barrier with explicit tuning. */
     public PlurimaConsumerBuilder<K, V> adaptiveDrainBarrier(AdaptiveBarrierConfig config) {
         this.adaptiveBarrierConfig = Objects.requireNonNull(config, "adaptiveBarrierConfig");
+        return this;
+    }
+
+    /**
+     * <b>SHARE engine only.</b> Bounds how long a single listener invocation may run. When a
+     * handler exceeds this, its worker thread is interrupted and the failure is routed through
+     * the retry/DLT pipeline as a {@link HandlerTimeoutException} (so it can be classified via
+     * {@code RetryPolicy.retryOn(HandlerTimeoutException.class)}). The handler must be
+     * interruptible for this to take effect. Off by default.
+     */
+    public PlurimaConsumerBuilder<K, V> handlerTimeout(Duration t) {
+        Objects.requireNonNull(t, "handlerTimeout");
+        if (t.isZero() || t.isNegative()) {
+            throw new IllegalArgumentException("handlerTimeout must be > 0, was " + t);
+        }
+        this.handlerTimeout = t;
         return this;
     }
 
@@ -319,6 +389,12 @@ public final class PlurimaConsumerBuilder<K, V> {
                     + "engine uses a continuous-poll model with no drain barrier. Remove "
                     + ".adaptiveDrainBarrier(...) or use engine=SHARE.");
             }
+            if (handlerTimeout != null) {
+                throw new IllegalArgumentException(
+                    "handlerTimeout is not supported with engine=CLASSIC_BASIC in this release — "
+                    + "the classic engine does not wire a per-handler watchdog. Remove "
+                    + ".handlerTimeout(...) or use engine=SHARE.");
+            }
             // No retry-delay vs max.poll.interval.ms check: the continuous-poll model means
             // the poll thread heartbeats every iteration regardless of how long a worker
             // sleeps for retry. Workers can sleep arbitrarily without fencing the consumer.
@@ -344,7 +420,7 @@ public final class PlurimaConsumerBuilder<K, V> {
             concurrencyExplicitlySet,
             effectiveShardCount, retryPolicy, dltConfig,
             pollTimeout, lockDuration, shutdownDrainTimeout, this.metrics,
-            adaptiveBarrierConfig);
+            adaptiveBarrierConfig, lockDurationExplicitlySet, handlerTimeout);
     }
 
     /**

@@ -1,8 +1,8 @@
 # Plurima - User Guide
 
-> A production-grade abstraction over `KafkaShareConsumer` (KIP-932) and vanilla `KafkaConsumer`. Per-key ordering with intra-partition parallelism, exponential retry, dead-letter routing, and Spring Boot integration.
+> A production-grade abstraction over `KafkaShareConsumer` (KIP-932) and vanilla `KafkaConsumer`. Share-group fan-out, classic per-key ordering with intra-partition parallelism, exponential retry, dead-letter routing, and Spring Boot integration.
 
-**Status:** v0.1.0 — first release with both engines.
+**Status:** v0.2.0 — adds the `Message` handler API, handler timeouts, lock-duration auto-alignment, and slowness-aware retry budgeting.
 
 ---
 
@@ -90,10 +90,10 @@ kafka-share-groups.sh --bootstrap-server localhost:9092 \
 
 ```kotlin
 dependencies {
-    implementation("io.plurima:kafka-plurima-core:0.1.0")
+    implementation("io.plurima:kafka-plurima-core:0.2.0")
     // Optional:
-    implementation("io.plurima:kafka-plurima-metrics:0.1.0")
-    implementation("io.plurima:kafka-plurima-spring-boot-starter:0.1.0")
+    implementation("io.plurima:kafka-plurima-metrics:0.2.0")
+    implementation("io.plurima:kafka-plurima-spring-boot-starter:0.2.0")
 }
 ```
 
@@ -136,13 +136,14 @@ The consumer runs until you `close()` it (try-with-resources does this automatic
 ```java
 PlurimaConsumer.<K, V>builder()
     .kafkaProperties(props)              // REQUIRED — bootstrap.servers, group.id, etc.
-    .topic("orders")                      // REQUIRED — single topic per consumer in v0.1
-    .listener((r, ctx) -> { ... })       // REQUIRED — OR .manualAckListener(...)
+    .topic("orders")                      // REQUIRED — single topic per consumer
+    .listener((r, ctx) -> { ... })       // REQUIRED — OR .manualAckListener(...) / .onMessage(...) / .onMessageAck(...)
     .ordering(OrderingMode.UNORDERED)    // default UNORDERED; KEY/PARTITION require CLASSIC_BASIC
     .concurrency(50)                      // max concurrent in-flight records, default 50
     .shardCount(200)                      // KEY mode only; default = concurrency × 4
     .pollTimeout(Duration.ofSeconds(1))  // poll() timeout, default 1s
-    .lockDuration(Duration.ofSeconds(30))// broker's record-lock timeout (informational)
+    .lockDuration(Duration.ofSeconds(30))// SHARE force-RELEASE deadline; if unset, auto-aligned to 0.8× broker lock
+    .handlerTimeout(Duration.ofSeconds(30)) // SHARE only; interrupt a handler that runs longer (off by default)
     .shutdownDrainTimeout(Duration.ofSeconds(30))
     .keyDeserializer(RecordDeserializer.utf8String())   // default: identity bytes
     .valueDeserializer(RecordDeserializer.utf8String()) // default: identity bytes
@@ -217,7 +218,82 @@ are silent no-ops.
 
 If a manual-ack listener throws without acknowledging, the retry/DLT pipeline runs as usual.
 
-`.listener(...)` and `.manualAckListener(...)` are **mutually exclusive** — calling both throws `IllegalStateException` at `build()`.
+`.listener(...)`, `.manualAckListener(...)`, `.onMessage(...)`, and `.onMessageAck(...)` are **mutually exclusive** — configuring more than one throws `IllegalStateException` immediately.
+
+### Message handlers for complex applications (`onMessage` / `onMessageAck`) — preferred
+
+`RecordListener` hands you a raw `ConsumerRecord` plus a separate `ConsumerContext`.
+For anything beyond a one-liner — a handler with injected dependencies, multiple
+methods, and unit tests — prefer the `Message`-based API. `Message<K,V>` is a
+Kafka-decoupled view that unifies payload and metadata in one object, so business
+code does not need Kafka client types.
+
+**Auto-ack** — `onMessage(MessageListener)` has the same semantics as
+`RecordListener`: normal return ACCEPTs the record; throwing routes through retry/DLT.
+
+```java
+import io.plurima.kafka.Message;
+import io.plurima.kafka.MessageListener;
+
+class OrderHandler implements MessageListener<String, Order> {
+    private final OrderService service;
+
+    OrderHandler(OrderService service) {
+        this.service = service;
+    }
+
+    @Override
+    public void onMessage(Message<String, Order> msg) {
+        if (msg.header("x-skip").isPresent()) return;
+        service.process(msg.value());
+    }
+}
+
+PlurimaConsumer.<String, Order>builder()
+    .kafkaProperties(props)
+    .topic("orders")
+    .onMessage(new OrderHandler(orderService))
+    .build();
+```
+
+**Explicit ack** — `onMessageAck(MessageAckListener)` gives one object carrying
+payload, metadata, and ack operations:
+
+```java
+.onMessageAck(msg -> {
+    if (msg.deliveryCount() > 5) {
+        msg.reject();
+        return;
+    }
+    try {
+        service.process(msg.value());
+        msg.accept();
+    } catch (TransientException e) {
+        msg.release();
+    }
+})
+```
+
+`AckMessage` adds `acknowledge(type)` plus `accept()`, `release()`, and `reject()`.
+A return without acking auto-RELEASEs, same as `ManualAckListener`.
+
+**Testing.** Build a `Message` with no broker via `Messages` and call your handler directly:
+
+```java
+import io.plurima.kafka.Message;
+import io.plurima.kafka.Messages;
+
+new OrderHandler(orderService).onMessage(Messages.of("k1", order));
+
+Message<String, Order> retryMessage = Messages.builder("k1", order)
+    .deliveryCount((short) 3)
+    .header("trace-id", traceBytes)
+    .build();
+```
+
+These adapt onto `RecordListener` / `ManualAckListener` internally, so retry, DLT,
+slowness handling, handler timeout, and metrics all apply unchanged. Use the raw
+`RecordListener` only when you specifically need the `ConsumerRecord`.
 
 ---
 
@@ -484,17 +560,60 @@ without completing, the poll thread RELEASEs it explicitly — the broker hands 
 record straight back to the share group instead of waiting for its own acquisition-
 lock expiry.
 
-**Set this BELOW the broker's `group.share.record.lock.duration.ms`** — typically
-≈ 80 % of it. At startup, on the first successful poll, Plurima compares the value
-against the broker's reported lock duration:
+**If you do NOT set `.lockDuration(...)`, Plurima auto-aligns it for you.** On the
+first successful poll it reads the broker's `group.share.record.lock.duration.ms`
+and sets the force-RELEASE deadline to **0.8 × that value** — maximizing the window
+in which a slow-but-healthy handler is left alone while still firing before the
+broker's own expiry:
+
+`Auto-aligned drain barrier to PT48S (0.8 × broker group.share.record.lock.duration.ms=PT1M). Call .lockDuration(...) to override.`
+
+**If you set `.lockDuration(...)` explicitly**, that value is used verbatim and should
+be BELOW the broker's lock (≈ 80 %). At startup Plurima compares it against the
+broker's value:
 
 - **local < broker** → INFO log:
   `PollLoop lockDuration check OK: local=PT24S < broker=PT30S (force-RELEASE will fire 6000ms before broker would expire the lease).`
 - **local ≥ broker** → ERROR log:
-  `Plurima's local lockDuration=PT30S is NOT smaller than the broker's group.share.record.lock.duration.ms=PT30S. The broker will redeliver stuck records before Plurima's force-RELEASE can fire — no early-recovery benefit. Lower .lockDuration(...) on the builder to ≈ 0.8 × broker lock for faster handler-stuck recovery.`
+  `Plurima's local lockDuration=PT30S is NOT smaller than the broker's group.share.record.lock.duration.ms=PT30S ...`
 
 The ERROR is loud but non-fatal: the consumer still functions correctly, it just
-doesn't get the early-recovery benefit. Tune `.lockDuration(...)` and restart.
+doesn't get the early-recovery benefit. Tune `.lockDuration(...)` or remove it to
+let Plurima auto-align, then restart.
+
+### Slow handlers are not mistaken for failures
+
+When the drain barrier force-RELEASEs a slow record, the broker redelivers it and
+increments its `deliveryCount`. Plurima's retry budget is derived from
+`deliveryCount`, so force-RELEASE redeliveries are tracked and subtracted from the
+effective attempt count. Only genuine failure-driven retries — a handler that threw
+or timed out — count toward `RetryPolicy.maxAttempts()` and DLT routing.
+
+This is automatic; no configuration is required.
+
+### Bounding a single handler (`.handlerTimeout(...)`)
+
+**SHARE engine only.** To bound how long one handler invocation may run, set
+`.handlerTimeout(Duration)`. When a listener exceeds it, its worker thread is
+interrupted and the failure is routed through retry/DLT as a
+`HandlerTimeoutException`:
+
+```java
+import io.plurima.kafka.HandlerTimeoutException;
+import io.plurima.kafka.retry.RetryPolicy;
+```
+
+```java
+.handlerTimeout(Duration.ofSeconds(30))
+.retry(RetryPolicy.exponential()
+    .retryOn(HandlerTimeoutException.class)
+    .maxAttempts(3)
+    .build())
+```
+
+The handler must be interruptible for this to take effect. A handler that swallows
+interrupts and runs to completion is treated as a normal success. This is off by
+default and is rejected on `ConsumerEngine.CLASSIC_BASIC` in this release.
 
 ### When handlers genuinely run longer than the broker lock
 
@@ -514,6 +633,10 @@ change:
    independently of workers, so `max.poll.interval.ms` is satisfied by the poll-thread
    cadence and individual handlers can run arbitrarily long without fencing the
    consumer.
+5. **Bound the handler with `.handlerTimeout(...)`** — if a handler runs longer than
+   it should ever take, interrupt it and route it through retry/DLT rather than letting
+   it hold a record. This bounds runaway handlers; it does not make a legitimately
+   long-running handler duplicate-free when it exceeds the broker lock.
 
 ---
 
@@ -578,7 +701,7 @@ Plurima emits 15 metrics: 11 counters, 2 gauges, and 2 timers.
 | `plurima.consumer.process.duration` | Timer | `topic` | Listener invocation latency |
 | `plurima.consumer.poll.duration` | Timer | — | Duration of a single poll() call |
 
-Metric names are **stable for the 0.1.x line**. Additional metrics may be added in
+Metric names are **stable for the 0.2.x line**. Additional metrics may be added in
 future minor releases without removing or renaming the existing public metrics.
 
 ### Custom implementation
@@ -604,7 +727,7 @@ The starter auto-configures `PlurimaConsumer` instances for any `@PlurimaListene
 ### Add the starter
 
 ```kotlin
-implementation("io.plurima:kafka-plurima-spring-boot-starter:0.1.0")
+implementation("io.plurima:kafka-plurima-spring-boot-starter:0.2.0")
 ```
 
 ### Configure `application.yml`
@@ -761,7 +884,7 @@ kafka-share-groups.sh --bootstrap-server localhost:9092 \
 
 Otherwise the group starts at `latest` (the default) and only sees records produced AFTER its first heartbeat.
 
-### Single topic per consumer (v0.1)
+### Single topic per consumer
 
 `PlurimaConsumerBuilder` accepts one `.topic("X")`. Multi-topic subscriptions in one consumer are deferred. Workaround: build multiple `PlurimaConsumer` instances, one per topic, in the same share group.
 
@@ -771,7 +894,7 @@ Without explicit deserializers, the consumer is `PlurimaConsumer<byte[], byte[]>
 
 ### Deferred metrics
 
-The v0.1.0 metrics surface is the 15 metrics listed above: 11 counters, 2 gauges
+The v0.2.0 metrics surface is the 15 metrics listed above: 11 counters, 2 gauges
 (`plurima.consumer.records.in_flight`, `plurima.consumer.barrier.timeout_ms`), and
 2 timers (`plurima.consumer.process.duration`, `plurima.consumer.poll.duration`). Histograms
 (`records.delivery_count`, etc.), the broker-lag gauge (`plurima.consumer.lag`,

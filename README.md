@@ -14,7 +14,7 @@ Production-grade Kafka consumer abstraction over Kafka 4.2 share groups
 Plurima gives Java services a single API for high-concurrency message processing,
 retry, dead-letter routing, metrics, and Spring Boot integration.
 
-**Current version:** `0.1.0`
+**Current version:** `0.2.0`
 
 ## Why Plurima
 
@@ -34,6 +34,8 @@ Plurima packages those concerns into a small library surface:
   and safe commit-frontier tracking for classic groups.
 - **Retry and DLT**: exponential retry policy, delayed retry via broker redelivery,
   and configurable dead-letter topic publishing.
+- **Application-friendly handlers**: Kafka-decoupled `Message<K,V>` APIs for
+  handlers that should be easy to test without a broker.
 - **Operational visibility**: built-in metrics SPI plus Micrometer adapter.
 - **Spring Boot starter**: annotation-driven listeners and property binding.
 
@@ -59,8 +61,7 @@ See [Benchmark Results](docs/Benchmarks.md) for methodology, raw output, limitat
 and scenario details. These figures are from one local run and are not a general
 performance guarantee.
 
-The benchmark implementation is included in this repository. Run it against a
-local Kafka broker with:
+From a source checkout, run the benchmark against a local Kafka broker with:
 
 ```bash
 ./gradlew benchmark
@@ -70,9 +71,9 @@ local Kafka broker with:
 
 | Module | Maven coordinate | Purpose |
 |---|---|---|
-| `core` | `io.plurima:kafka-plurima-core:0.1.0` | Consumer runtime, retry, DLT, ordering, public API |
-| `metrics` | `io.plurima:kafka-plurima-metrics:0.1.0` | Micrometer implementation of `PlurimaMetrics` |
-| `spring-boot-starter` | `io.plurima:kafka-plurima-spring-boot-starter:0.1.0` | Spring Boot auto-configuration and `@PlurimaListener` |
+| `core` | `io.plurima:kafka-plurima-core:0.2.0` | Consumer runtime, retry, DLT, ordering, public API |
+| `metrics` | `io.plurima:kafka-plurima-metrics:0.2.0` | Micrometer implementation of `PlurimaMetrics` |
+| `spring-boot-starter` | `io.plurima:kafka-plurima-spring-boot-starter:0.2.0` | Spring Boot auto-configuration and `@PlurimaListener` |
 
 ## Requirements
 
@@ -106,11 +107,11 @@ See [examples/README.md](examples/README.md) for cleanup and troubleshooting.
 
 ```kotlin
 dependencies {
-    implementation("io.plurima:kafka-plurima-core:0.1.0")
+    implementation("io.plurima:kafka-plurima-core:0.2.0")
 
     // Optional integrations
-    implementation("io.plurima:kafka-plurima-metrics:0.1.0")
-    implementation("io.plurima:kafka-plurima-spring-boot-starter:0.1.0")
+    implementation("io.plurima:kafka-plurima-metrics:0.2.0")
+    implementation("io.plurima:kafka-plurima-spring-boot-starter:0.2.0")
 }
 ```
 
@@ -142,6 +143,22 @@ try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>
 }
 ```
 
+For application code that should not depend on Kafka client types, prefer the
+`Message` API:
+
+```java
+import io.plurima.kafka.Message;
+import io.plurima.kafka.PlurimaConsumer;
+
+PlurimaConsumer.<String, Order>builder()
+    .kafkaProperties(props)
+    .topic("orders")
+    .onMessage((Message<String, Order> msg) -> {
+        handleOrder(msg.key(), msg.value());
+    })
+    .build();
+```
+
 ### Classic Engine With Per-Key FIFO
 
 ```java
@@ -169,7 +186,7 @@ PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>build
 | `CLASSIC_BASIC` | Existing consumer groups, partition assignment, cross-instance ordering control | `UNORDERED`, `PARTITION`, `KEY` |
 
 The builder rejects unsupported combinations at build time. For example, key ordering
-is classic-only in `0.1.0` because Kafka share groups do not provide cross-instance
+is classic-only because Kafka share groups do not provide cross-instance
 per-key FIFO semantics.
 
 ## Retry And Dead-Letter Routing
@@ -246,15 +263,15 @@ when they are present.
   retry/DLT, metrics, Spring Boot, shutdown, and troubleshooting.
 - [Benchmark Results](docs/Benchmarks.md): comparison with direct Kafka client
   implementations and interpretation of the measured results.
-- [CHANGELOG](CHANGELOG.md): release notes for `0.1.0`.
+- [CHANGELOG](CHANGELOG.md): release notes for published versions.
 - Javadocs: public API contracts for `PlurimaConsumer`, `ConsumerEngine`,
   `OrderingMode`, `RetryPolicy`, `DltConfig`, and `PlurimaMetrics`.
 
 ## Project Status
 
-`0.1.0` is the first public release line. It includes both the Kafka 4.2 share-group
-engine and the classic consumer-group engine, with live Kafka integration coverage
-in CI.
+`0.2.0` builds on the first public release with a Kafka-decoupled `Message` handler
+API, SHARE handler timeouts, lock-duration auto-alignment, and slowness-aware retry
+budgeting. The project includes live Kafka integration coverage in CI.
 
 ## License
 
@@ -263,7 +280,7 @@ Apache License 2.0. See [LICENSE](LICENSE).
 ## Trademark Notice
 
 KAFKA is a registered trademark of The Apache Software Foundation and has been
-licensed for use by plurima. plurima has no affiliation with and is not endorsed
+licensed for use by Plurima. Plurima has no affiliation with and is not endorsed
 by The Apache Software Foundation.
 
 See the [Apache Kafka trademark guidance](https://kafka.apache.org/community/trademark/).

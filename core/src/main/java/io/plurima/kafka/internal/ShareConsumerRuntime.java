@@ -19,6 +19,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -53,8 +55,11 @@ public final class ShareConsumerRuntime<K, V> implements ConsumerRuntime {
     private final Duration shutdownDrainTimeout;
     private final PlurimaMetrics metrics;
     private final AdaptiveBarrierConfig adaptiveBarrierConfig; // nullable; null = disabled
+    private final boolean lockDurationExplicitlySet;
+    private final Duration handlerTimeout; // nullable; null = no per-handler timeout
 
     private volatile ShareConsumer<byte[], byte[]> consumer;
+    private volatile ScheduledExecutorService timeoutScheduler; // nullable; created when handlerTimeout set
     private volatile PollLoop pollLoop;
     private volatile Thread pollThread;
     private volatile WorkerLauncher workerLauncher;
@@ -83,7 +88,9 @@ public final class ShareConsumerRuntime<K, V> implements ConsumerRuntime {
         Duration lockDuration,
         Duration shutdownDrainTimeout,
         PlurimaMetrics metrics,
-        AdaptiveBarrierConfig adaptiveBarrierConfig) {
+        AdaptiveBarrierConfig adaptiveBarrierConfig,
+        boolean lockDurationExplicitlySet,
+        Duration handlerTimeout) {
         this.kafkaProperties = kafkaProperties;
         this.topic = topic;
         this.listener = listener;
@@ -100,6 +107,8 @@ public final class ShareConsumerRuntime<K, V> implements ConsumerRuntime {
         this.shutdownDrainTimeout = shutdownDrainTimeout;
         this.metrics = metrics;
         this.adaptiveBarrierConfig = adaptiveBarrierConfig;
+        this.lockDurationExplicitlySet = lockDurationExplicitlySet;
+        this.handlerTimeout = handlerTimeout;
     }
 
     @Override
@@ -144,7 +153,11 @@ public final class ShareConsumerRuntime<K, V> implements ConsumerRuntime {
         }
         String groupId = props.getProperty("group.id", "unknown");
         metrics.registerInFlightGauge(topic, groupId, clientId, registry::currentInFlight);
-        AckCoordinator coordinator = new AckCoordinator(registry, metrics);
+        // Tracks drain-barrier force-RELEASEs (slowness, not failure) so RetryEngine/DltRouter
+        // don't count the resulting broker redeliveries toward retry exhaustion. Bounded LRU.
+        SlownessReleaseTracker slownessTracker =
+            new SlownessReleaseTracker(Math.max(4096, concurrency * 16));
+        AckCoordinator coordinator = new AckCoordinator(registry, metrics, slownessTracker);
         BackpressureGate gate = new BackpressureGate(concurrency);
         WorkerLauncher launcher = new WorkerLauncher();
 
@@ -157,19 +170,29 @@ public final class ShareConsumerRuntime<K, V> implements ConsumerRuntime {
             sc.setAcknowledgementCommitCallback(coordinator);
             sc.subscribe(List.of(topic));
 
-            localDltRouter = dltConfig != null ? new DltRouter(dltConfig, metrics) : null;
+            localDltRouter = dltConfig != null ? new DltRouter(dltConfig, metrics, slownessTracker) : null;
             ListenerInvoker invoker = listener != null
                 ? ListenerInvoker.forImplicit(listener, keyDeserializer, valueDeserializer)
                 : ListenerInvoker.forManual(manualAckListener, keyDeserializer, valueDeserializer);
             HandlerLatencyWindow latencyWindow =
                 adaptiveBarrierConfig != null ? new HandlerLatencyWindow(ADAPTIVE_WINDOW_SIZE) : null;
+            // Shared daemon watchdog scheduler for per-handler timeouts (P3); null when off.
+            this.timeoutScheduler = handlerTimeout != null
+                ? Executors.newSingleThreadScheduledExecutor(rr -> {
+                    Thread th = new Thread(rr, "plurima-handler-timeout");
+                    th.setDaemon(true);
+                    return th;
+                })
+                : null;
             WorkerProcessor workerProcessor = new WorkerProcessor(
                 invoker,
-                new RetryEngine(retryPolicy),
+                new RetryEngine(retryPolicy, slownessTracker),
                 coordinator,
                 localDltRouter,
                 metrics,
-                latencyWindow);
+                latencyWindow,
+                handlerTimeout,
+                timeoutScheduler);
             // SHARE engine supports only UNORDERED as of v0.1 — KEY and PARTITION are
             // rejected at PlurimaConsumerBuilder.build(). The throw is unreachable in
             // practice; it exists so that future enum additions surface here.
@@ -187,7 +210,7 @@ public final class ShareConsumerRuntime<K, V> implements ConsumerRuntime {
                 // the WorkerLauncher / DltRouter / KafkaShareConsumer can't leak. close()
                 // is idempotent via the AtomicBoolean below, so a later user-initiated
                 // close() is a safe no-op.
-                this::close, latencyWindow, adaptiveBarrierConfig);
+                this::close, latencyWindow, adaptiveBarrierConfig, lockDurationExplicitlySet);
             if (adaptiveBarrierConfig != null) {
                 metrics.registerBarrierTimeoutGauge(topic, groupId, clientId, loop::currentBarrierMillis);
             }
@@ -218,6 +241,7 @@ public final class ShareConsumerRuntime<K, V> implements ConsumerRuntime {
             if (localDltRouter != null) RuntimeCleanup.quietly(localDltRouter::close);
             if (sc != null) RuntimeCleanup.quietly(sc::close);
             RuntimeCleanup.quietly(launcher::close);
+            if (timeoutScheduler != null) RuntimeCleanup.quietly(timeoutScheduler::shutdownNow);
             throw e;
         }
     }
@@ -234,6 +258,8 @@ public final class ShareConsumerRuntime<K, V> implements ConsumerRuntime {
         }
         if (workerLauncher != null) workerLauncher.close();
         if (dltRouter != null) RuntimeCleanup.logIfRaised("DltRouter", dltRouter::close);
+        // Stop the handler-timeout watchdog scheduler (no-op if renewal/timeout was off).
+        if (timeoutScheduler != null) RuntimeCleanup.quietly(timeoutScheduler::shutdownNow);
     }
 
     /** Test seam: whether close() has actually run. */

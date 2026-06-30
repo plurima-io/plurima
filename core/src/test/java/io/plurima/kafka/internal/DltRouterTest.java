@@ -190,6 +190,37 @@ class DltRouterTest {
     }
 
     @Test
+    void attemptCountSubtractsSlownessReleases() throws Exception {
+        // deliveryCount=5 (4 redeliveries) but 3 were slowness force-RELEASEs, not failures → the
+        // DLT attempt header must report only the genuine attempts: max(0, (5-1) - 3) = 1.
+        ConsumerRecord<byte[], byte[]> cr = new ConsumerRecord<>(
+            "orders", 0, 17L, 0L,
+            org.apache.kafka.common.record.TimestampType.NO_TIMESTAMP_TYPE,
+            -1, -1,
+            "k".getBytes(), "v".getBytes(),
+            new org.apache.kafka.common.header.internals.RecordHeaders(),
+            java.util.Optional.empty(),
+            java.util.Optional.of((short) 5));
+        InFlightRecord<byte[], byte[]> r = new InFlightRecord<>(cr);
+
+        SlownessReleaseTracker tracker = new SlownessReleaseTracker(1024);
+        RecordCoord coord = new RecordCoord("orders", 0, 17L);
+        tracker.recordRelease(coord);
+        tracker.recordRelease(coord);
+        tracker.recordRelease(coord);
+
+        try (DltRouter router = new DltRouter(
+                producer, config, io.plurima.kafka.metrics.PlurimaMetrics.noOp(), tracker)) {
+            router.route(r, new IOException("t")).future().get(2, TimeUnit.SECONDS);
+        }
+
+        Map<String, String> headers = headerMap(producer.history().get(0));
+        assertThat(headers.get("plurima-dlt-attempt-count"))
+            .as("slowness force-RELEASEs are subtracted from the broker deliveryCount in the DLT header")
+            .isEqualTo("1");
+    }
+
+    @Test
     void synchronousProducerThrowEmitsDltFailedMetric() {
         // SerializationException, BufferExhaustedException, KafkaException on shutdown
         // etc. can be thrown synchronously by producer.send BEFORE any callback. Without

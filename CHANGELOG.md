@@ -4,6 +4,33 @@ All notable changes to Plurima are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-06-28
+
+SHARE-engine reliability and handler-ergonomics upgrade. All changes are additive and sit off
+the verified completion/ack core.
+
+### Added
+- **`Message` handler API** (preferred for application handlers): `Message<K,V>` — a
+  Kafka-decoupled view unifying payload + metadata — with `MessageListener` (auto-ack) and
+  `AckMessage`/`MessageAckListener` (explicit ack: `accept()` / `release()` / `reject()`), wired
+  via `PlurimaConsumerBuilder.onMessage(...)` / `onMessageAck(...)`. Plus a `Messages` factory for
+  building messages in unit tests with no broker.
+- **Handler timeout** (`.handlerTimeout(Duration)`, SHARE only): interrupts a handler that runs
+  too long and routes it through retry/DLT as `HandlerTimeoutException` (classifiable via
+  `retryOn(...)`).
+- **Lock-duration auto-alignment** (SHARE): when `.lockDuration(...)` is not set, the drain
+  barrier is auto-aligned to 0.8 × the broker's record-lock duration once discovered, maximizing
+  the no-force-release window.
+
+### Changed / Fixed
+- **Slow records are no longer mistaken for failures**: drain-barrier force-RELEASEs are tracked
+  and subtracted from the effective attempt count, so a slow-but-healthy record is not wrongly
+  routed to the DLT. Slowness counts are cleared on terminal completion.
+- **Builder rejects more than one handler** immediately (exactly one of
+  `listener`/`manualAckListener`/`onMessage`/`onMessageAck`).
+- Handler-timeout interrupt handling preserves non-timeout (e.g. shutdown) interrupts so retries
+  abort promptly.
+
 ## [0.1.0] — 2026-05-24
 
 The first release that targets both Kafka engines. Brings cross-cluster per-key FIFO
@@ -97,4 +124,5 @@ ordering on share groups was never load-bearing across the cluster.
 
 Internal pre-release iterations. No published artifacts. See git history for context.
 
+[0.2.0]: https://github.com/plurima-io/plurima/releases/tag/v0.2.0
 [0.1.0]: https://github.com/plurima-io/plurima/releases/tag/v0.1.0
