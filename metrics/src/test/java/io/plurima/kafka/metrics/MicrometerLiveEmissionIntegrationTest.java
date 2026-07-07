@@ -97,7 +97,7 @@ class MicrometerLiveEmissionIntegrationTest {
             producer.flush();
         }
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(props)
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -110,7 +110,7 @@ class MicrometerLiveEmissionIntegrationTest {
                 .jitter(0.0)
                 .retryOn(RuntimeException.class)
                 .build())
-            .deadLetterTopic(dlt)
+            .deadLetter(dlt)
             .pollTimeout(Duration.ofMillis(200))
             .shutdownDrainTimeout(Duration.ofSeconds(10))
             .metrics(metrics)
@@ -250,7 +250,7 @@ class MicrometerLiveEmissionIntegrationTest {
         CountDownLatch processed = new CountDownLatch(total);
         RecordListener<byte[], byte[]> listener = (rec, ctx) -> processed.countDown();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(props)
             .topic(topic)
             .engine(ConsumerEngine.SHARE)
@@ -290,13 +290,13 @@ class MicrometerLiveEmissionIntegrationTest {
         assertThat(processedAccept.count()).isGreaterThanOrEqualTo(total);
 
         Counter ackQueued = required(registry, "plurima.consumer.ack.queued", Counter.class,
-            "type", "ACCEPT");
+            "type", "accept");
         assertThat(ackQueued.count())
             .as("ack.queued is SHARE-only — must fire for every processed record")
             .isGreaterThanOrEqualTo(total);
 
         Counter ackCommitted = required(registry, "plurima.consumer.ack.committed", Counter.class,
-            "topic", topic, "type", "ACCEPT");
+            "topic", topic, "type", "accept");
         assertThat(ackCommitted.count())
             .as("ack.committed fires when the broker confirms the share-ack callback")
             .isGreaterThanOrEqualTo(1.0);

@@ -12,6 +12,11 @@ Plurima while holding the workload constant.
 - Measurement: wall-clock time from the first handled record to the last handled
   record
 
+> **Note:** these numbers were captured against the `4.2.1-rc5` release candidate
+> broker image because it was the newest available Kafka 4.2 build with share-group
+> support at the time of measurement. They will be refreshed against a GA (non-rc)
+> broker once one is available; treat the figures as indicative, not final.
+
 ## Results
 
 | Scenario | Vanilla Kafka | Plurima | Result |

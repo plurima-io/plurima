@@ -107,7 +107,7 @@ public final class OrderingTestApp {
         Map<Integer, List<Integer>> observedSeqByPartition = new ConcurrentHashMap<>();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -162,7 +162,7 @@ public final class OrderingTestApp {
         List<Integer> observed = new CopyOnWriteArrayList<>();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -218,7 +218,7 @@ public final class OrderingTestApp {
             .retryOn(RuntimeException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -293,7 +293,7 @@ public final class OrderingTestApp {
         AtomicInteger maxConcurrent = new AtomicInteger();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -372,7 +372,7 @@ public final class OrderingTestApp {
         Map<String, List<Integer>> observedByKey = new ConcurrentHashMap<>();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -443,7 +443,7 @@ public final class OrderingTestApp {
             .retryOn(RuntimeException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -512,7 +512,7 @@ public final class OrderingTestApp {
         AtomicInteger maxConcurrent = new AtomicInteger();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -573,7 +573,7 @@ public final class OrderingTestApp {
         Map<String, Integer> partitionByKey = new HashMap<>();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -657,7 +657,7 @@ public final class OrderingTestApp {
             .retryOn(RuntimeException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)

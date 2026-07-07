@@ -123,40 +123,55 @@ final class ClassicKeyShardDispatcher implements ClassicDispatcher {
      * seen {@code busy == true} and not launched anything, so the queue would stall.
      * After releasing, peek the queue; if non-empty, try to reclaim {@code busy} and
      * resume the chain.
+     *
+     * <p>Iterative, not recursive: both the busy-release double-check and the
+     * per-entry launch-rejection recovery (see the catch below) loop back to the top
+     * instead of calling {@code launchNext} again. A deep queue drained entirely
+     * through the rejection path — e.g. every launch failing during shutdown — would
+     * otherwise recurse once per queued entry on a single thread, an unbounded
+     * stack-depth hazard. The loop makes that drain O(1) in stack depth regardless of
+     * queue size, with identical behavior on every path: {@code onRecordDone} still
+     * fires exactly once per record.
      */
     private void launchNext(Shard shard) {
-        Entry next = shard.queue.poll();
-        if (next == null) {
-            shard.busy.set(false);
-            if (!shard.queue.isEmpty() && shard.busy.compareAndSet(false, true)) {
-                launchNext(shard);
+        while (true) {
+            Entry next = shard.queue.poll();
+            if (next == null) {
+                shard.busy.set(false);
+                if (shard.queue.isEmpty() || !shard.busy.compareAndSet(false, true)) {
+                    return;
+                }
+                // Reclaimed busy after the double-check race — loop back and poll
+                // again instead of recursing.
+                continue;
             }
-            return;
-        }
-        try {
-            launcher.launch(() -> processThenAdvance(shard, next));
-        } catch (Throwable t) {
-            // Launcher rejected the task (typically RejectedExecutionException on
-            // shutdown or worker pool saturation). We already polled the Entry from
-            // the queue; if we returned here without further action the entry would
-            // be lost AND its onRecordDone would never fire — ClassicPollLoop's
-            // inFlight counter would stay too high and backpressure would lock up.
-            //
-            // Recovery:
-            //   1. Fire onRecordDone for THIS entry only (decrements inFlight by 1).
-            //   2. Recurse into launchNext to try the next queued entry. If the
-            //      next launch also fails we keep recursing; eventually the queue
-            //      drains and busy is released. Bounded by queue size.
-            //
-            // We deliberately do NOT throw — the dispatch caller (ClassicPollLoop)
-            // must NOT roll back inFlight for the whole batch, because earlier
-            // records on OTHER shards (or this shard's earlier successful launches)
-            // are already running and will fire their own onRecordDone.
-            log.error("Worker launch rejected for {} (likely shutdown or pool saturation); "
-                + "dropping record and continuing with next queued entry",
-                shard.tp, t);
-            next.onRecordDone.run();
-            launchNext(shard);
+            try {
+                launcher.launch(() -> processThenAdvance(shard, next));
+                return;
+            } catch (Throwable t) {
+                // Launcher rejected the task (typically RejectedExecutionException on
+                // shutdown or worker pool saturation). We already polled the Entry from
+                // the queue; if we returned here without further action the entry would
+                // be lost AND its onRecordDone would never fire — ClassicPollLoop's
+                // inFlight counter would stay too high and backpressure would lock up.
+                //
+                // Recovery:
+                //   1. Fire onRecordDone for THIS entry only (decrements inFlight by 1).
+                //   2. Loop back to try the next queued entry. If the next launch also
+                //      fails we keep looping; eventually the queue drains and busy is
+                //      released. Bounded by queue size, but iteratively — not via
+                //      recursion — so depth never grows with the backlog.
+                //
+                // We deliberately do NOT throw — the dispatch caller (ClassicPollLoop)
+                // must NOT roll back inFlight for the whole batch, because earlier
+                // records on OTHER shards (or this shard's earlier successful launches)
+                // are already running and will fire their own onRecordDone.
+                log.error("Worker launch rejected for {} (likely shutdown or pool saturation); "
+                    + "dropping record and continuing with next queued entry",
+                    shard.tp, t);
+                next.onRecordDone.run();
+                // fall through to the top of the loop to try the next entry
+            }
         }
     }
 

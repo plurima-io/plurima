@@ -12,6 +12,8 @@ class CommitFrontierTest {
     void inOrderCompletionAdvancesLinearly() {
         CommitFrontier f = new CommitFrontier();
         f.observe(10);
+        f.observe(11);
+        f.observe(12);
         // Before any completion the frontier sits at the starting offset; drainCommittable
         // returns "next-to-consume = 10" once, then nothing until it advances.
         assertThat(f.drainCommittable()).hasValue(10L);
@@ -28,7 +30,7 @@ class CommitFrontierTest {
     @Test
     void outOfOrderCompletionParksAheadAndAdvancesOnGapClose() {
         CommitFrontier f = new CommitFrontier();
-        f.observe(0);
+        for (long o = 0; o <= 2; o++) f.observe(o);
         // 1, 2 finish before 0 — they get parked in completedAhead. Frontier stays at 0.
         f.complete(1);
         f.complete(2);
@@ -44,7 +46,7 @@ class CommitFrontierTest {
     @Test
     void sparseHoleHoldsFrontierUntilFilled() {
         CommitFrontier f = new CommitFrontier();
-        f.observe(0);
+        for (long o = 0; o <= 5; o++) f.observe(o);
         // Complete 0, 1, then skip 2 and complete 3, 4, 5.
         f.complete(0);
         f.complete(1);
@@ -65,6 +67,7 @@ class CommitFrontierTest {
     void drainOnlyEmitsWhenFrontierMoved() {
         CommitFrontier f = new CommitFrontier();
         f.observe(100);
+        f.observe(101);
         assertThat(f.drainCommittable()).hasValue(100L);
         assertThat(f.drainCommittable()).isEmpty();
 
@@ -82,6 +85,7 @@ class CommitFrontierTest {
     void duplicateCompletionBelowFrontierIsIgnored() {
         CommitFrontier f = new CommitFrontier();
         f.observe(0);
+        f.observe(1);
         f.complete(0);
         f.complete(1);
         assertThat(f.drainCommittable()).hasValue(2L);
@@ -94,12 +98,16 @@ class CommitFrontierTest {
 
     @Test
     void observeOnlyHonoredOnFirstCall() {
+        // "First call only" applies to the COMMIT FLOOR: only the first observe pins it.
+        // Later observes register additional delivered offsets (60, 100 below) but never
+        // move the floor.
         CommitFrontier f = new CommitFrontier();
         f.observe(50);
-        f.observe(60);  // ignored — frontier already started at 50
+        f.observe(60);  // queued as a delivered offset; floor stays 50
         assertThat(f.nextExpected()).isEqualTo(50L);
 
-        // A later observe AFTER advances also ignored.
+        // Completing 50 advances the frontier to 51 (60 still outstanding); a later
+        // observe(100) queues another delivered offset without touching the floor.
         f.complete(50);
         f.observe(100);
         assertThat(f.nextExpected()).isEqualTo(51L);
@@ -115,13 +123,73 @@ class CommitFrontierTest {
     }
 
     @Test
+    void gapInDeliveredOffsetsDoesNotStallCommits() {
+        // Compacted topic / read_committed: offset 6 is never delivered (compacted away, or a
+        // transaction-marker slot). The frontier must NOT wait for a completion of 6 — 6 was
+        // never delivered, so it can never complete. Only DELIVERED offsets (5 and 7) gate
+        // commits; the missing 6 must not stall the frontier forever.
+        CommitFrontier f = new CommitFrontier();
+        f.observe(5);
+        f.observe(7);   // 6 skipped — never delivered
+        assertThat(f.drainCommittable()).hasValue(5L);   // initial floor
+        assertThat(f.drainCommittable()).isEmpty();
+
+        // 7 completes first; 5 is still outstanding → no advance.
+        f.complete(7);
+        assertThat(f.drainCommittable()).isEmpty();
+
+        // 5 completes → sweep across the delivered offsets 5 then 7 (6 doesn't exist) → next = 8.
+        f.complete(5);
+        assertThat(f.drainCommittable()).hasValue(8L);
+        assertThat(f.gapSize()).isZero();
+    }
+
+    @Test
+    void gapWithOutOfOrderCompletion() {
+        // Delivered offsets 10, 12, 15 (11, 13, 14 never delivered — gaps). Completions arrive
+        // out of order; the frontier advances only across delivered offsets whose completions
+        // have arrived contiguously.
+        CommitFrontier f = new CommitFrontier();
+        f.observe(10);
+        f.observe(12);
+        f.observe(15);
+        assertThat(f.drainCommittable()).hasValue(10L);  // initial floor
+
+        f.complete(15);
+        f.complete(10);
+        // 10 done → next-to-consume = 11. (11 was never delivered, but committing 11 is valid:
+        // the broker redelivers from >= 11, i.e. 12.) 12 is not yet complete, so we stop there.
+        assertThat(f.drainCommittable()).hasValue(11L);
+
+        f.complete(12);
+        // 12 done → advance across 12 then 15 (13, 14 don't exist) → next = 16.
+        assertThat(f.drainCommittable()).hasValue(16L);
+        assertThat(f.gapSize()).isZero();
+    }
+
+    @Test
+    void denseOffsetsStillWork() {
+        // Regression: dense (gap-free) delivery must behave exactly as before — out-of-order
+        // completions absorbed in one sweep once the front closes.
+        CommitFrontier f = new CommitFrontier();
+        for (long o = 0; o <= 4; o++) f.observe(o);
+        f.complete(2);
+        f.complete(0);
+        f.complete(4);
+        f.complete(1);
+        f.complete(3);
+        assertThat(f.drainCommittable()).hasValue(5L);
+        assertThat(f.gapSize()).isZero();
+    }
+
+    @Test
     void parallelCompletionsAreThreadSafe() throws Exception {
         // Stress test: 1000 records, 16 threads completing in arbitrary order. Final
         // frontier must be 1000 with no parked entries — proves the synchronized methods
         // produce the correct linearization regardless of completion order.
         CommitFrontier f = new CommitFrontier();
         int total = 1000;
-        f.observe(0);
+        for (long o = 0; o < total; o++) f.observe(o);
 
         java.util.List<Long> offsets = new java.util.ArrayList<>();
         for (long i = 0; i < total; i++) offsets.add(i);
@@ -162,7 +230,7 @@ class CommitFrontierTest {
         // and the test must reach `total` deterministically.
         CommitFrontier f = new CommitFrontier();
         int total = 5_000;
-        f.observe(0);
+        for (long o = 0; o < total; o++) f.observe(o);
 
         java.util.List<Long> offsets = new java.util.ArrayList<>();
         for (long i = 0; i < total; i++) offsets.add(i);

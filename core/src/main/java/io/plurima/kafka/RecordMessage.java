@@ -2,7 +2,7 @@ package io.plurima.kafka;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.header.Header;
-import org.apache.kafka.common.header.Headers;
+import org.jspecify.annotations.Nullable;
 
 import java.time.Instant;
 import java.util.Objects;
@@ -19,22 +19,22 @@ import java.util.Optional;
 class RecordMessage<K, V> implements Message<K, V> {
 
     private final ConsumerRecord<K, V> record;
-    private final short deliveryCount;
+    private final int deliveryCount;
     private final OrderingMode orderingMode;
 
-    RecordMessage(ConsumerRecord<K, V> record, short deliveryCount, OrderingMode orderingMode) {
+    RecordMessage(ConsumerRecord<K, V> record, int deliveryCount, OrderingMode orderingMode) {
         this.record = Objects.requireNonNull(record, "record");
         this.deliveryCount = deliveryCount;
         this.orderingMode = Objects.requireNonNull(orderingMode, "orderingMode");
     }
 
-    @Override public K key() { return record.key(); }
-    @Override public V value() { return record.value(); }
+    @Override public @Nullable K key() { return record.key(); }
+    @Override public @Nullable V value() { return record.value(); }
     @Override public String topic() { return record.topic(); }
     @Override public int partition() { return record.partition(); }
     @Override public long offset() { return record.offset(); }
     @Override public Instant timestamp() { return Instant.ofEpochMilli(record.timestamp()); }
-    @Override public Headers headers() { return record.headers(); }
+    @Override public MessageHeaders headers() { return new KafkaMessageHeaders(record.headers()); }
 
     @Override
     public Optional<byte[]> header(String name) {
@@ -42,7 +42,6 @@ class RecordMessage<K, V> implements Message<K, V> {
         return h == null ? Optional.empty() : Optional.ofNullable(h.value());
     }
 
-    @Override public short deliveryCount() { return deliveryCount; }
-    @Override public Optional<Short> deliveryCountOptional() { return Optional.of(deliveryCount); }
+    @Override public int deliveryCount() { return deliveryCount; }
     @Override public OrderingMode orderingMode() { return orderingMode; }
 }

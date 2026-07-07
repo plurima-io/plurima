@@ -4,6 +4,7 @@ import io.plurima.kafka.ConsumerContext;
 import io.plurima.kafka.OrderingMode;
 import io.plurima.kafka.RecordListener;
 import io.plurima.kafka.ack.AckContext;
+import io.plurima.kafka.ack.AckType;
 import io.plurima.kafka.ack.ManualAckListener;
 import io.plurima.kafka.deserializer.RecordDeserializer;
 import org.apache.kafka.clients.consumer.AcknowledgeType;
@@ -13,7 +14,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -45,8 +45,7 @@ class ListenerInvokerTest {
 
     private ConsumerContext ctxFor(InFlightRecord<byte[], byte[]> r) {
         return new ConsumerContext() {
-            @Override public short deliveryCount() { return 1; }
-            @Override public Optional<Short> deliveryCountOptional() { return Optional.of((short) 1); }
+            @Override public int deliveryCount() { return 1; }
             @Override public OrderingMode orderingMode() { return OrderingMode.UNORDERED; }
         };
     }
@@ -96,7 +95,7 @@ class ListenerInvokerTest {
         AtomicReference<AckContext> seenAck = new AtomicReference<>();
         ManualAckListener<String, String> listener = (r, ack) -> {
             seenAck.set(ack);
-            ack.acknowledge(AcknowledgeType.ACCEPT);
+            ack.acknowledge(AckType.ACCEPT);
         };
         ListenerInvoker invoker = ListenerInvoker.forManual(
             listener, RecordDeserializer.utf8String(), RecordDeserializer.utf8String());
@@ -116,8 +115,8 @@ class ListenerInvokerTest {
     @Test
     void manualAckContextIsIdempotent() throws Throwable {
         ManualAckListener<byte[], byte[]> listener = (r, ack) -> {
-            ack.acknowledge(AcknowledgeType.ACCEPT);
-            ack.acknowledge(AcknowledgeType.REJECT); // second call ignored
+            ack.acknowledge(AckType.ACCEPT);
+            ack.acknowledge(AckType.REJECT); // second call ignored
         };
         ListenerInvoker invoker = ListenerInvoker.forManual(
             listener, RecordDeserializer.bytes(), RecordDeserializer.bytes());
@@ -163,27 +162,60 @@ class ListenerInvokerTest {
     }
 
     @Test
-    void manualInvokerDropsRenewAckWithWarnLog() throws Throwable {
-        java.util.concurrent.atomic.AtomicBoolean listenerCompleted = new java.util.concurrent.atomic.AtomicBoolean(false);
+    void manualInvokerMapsReleaseAckTypeToKafkaReleaseAcknowledgeType() throws Throwable {
+        // ACCEPT/REJECT/the auto-RELEASE path are covered above/elsewhere; this pins the
+        // remaining switch arm in IdempotentAckContext.toKafkaAcknowledgeType: a
+        // user-initiated acknowledge(AckType.RELEASE) must reach the coordinator as Kafka's
+        // AcknowledgeType.RELEASE (not, say, silently falling through to ACCEPT).
+        ManualAckListener<byte[], byte[]> listener = (r, ack) -> ack.acknowledge(AckType.RELEASE);
+        ListenerInvoker invoker = ListenerInvoker.forManual(
+            listener, RecordDeserializer.bytes(), RecordDeserializer.bytes());
+
+        InFlightRecord<byte[], byte[]> r = rec(9, new byte[0], new byte[0]);
+        invoker.invoke(r, ctxFor(r), coordinator);
+
+        coordinator.commitPendingAcks(consumer);
+        verify(consumer).acknowledge(
+            argThat((ConsumerRecord<byte[], byte[]> cr) ->
+                cr.topic().equals("t") && cr.offset() == 9L),
+            eq(AcknowledgeType.RELEASE));
+    }
+
+    @Test
+    void manualAckContextDelegatesDeliveryCountAndOrderingModeToTheUnderlyingContext() throws Throwable {
+        // IdempotentAckContext.deliveryCount()/orderingMode() must forward to the
+        // ConsumerContext it wraps, not return some independent/default value.
+        AtomicReference<AckContext> seenAck = new AtomicReference<>();
         ManualAckListener<byte[], byte[]> listener = (r, ack) -> {
-            ack.acknowledge(AcknowledgeType.RENEW); // should be silently dropped
-            listenerCompleted.set(true);
+            seenAck.set(ack);
+            ack.acknowledge(AckType.ACCEPT);
         };
         ListenerInvoker invoker = ListenerInvoker.forManual(
             listener, RecordDeserializer.bytes(), RecordDeserializer.bytes());
 
-        InFlightRecord<byte[], byte[]> r = rec(7, new byte[0], new byte[0]);
-        invoker.invoke(r, ctxFor(r), coordinator);
+        InFlightRecord<byte[], byte[]> r = rec(10, new byte[0], new byte[0]);
+        ConsumerContext delegate = new ConsumerContext() {
+            @Override public int deliveryCount() { return 7; }
+            @Override public OrderingMode orderingMode() { return OrderingMode.KEY; }
+        };
+        invoker.invoke(r, delegate, coordinator);
 
-        // RENEW was dropped, so wasAcked() is still false — auto-RELEASE should follow
-        coordinator.commitPendingAcks(consumer);
-        // Only the auto-RELEASE (queued by forManual because listener didn't ack) arrives
-        org.mockito.Mockito.verify(consumer).acknowledge(
-            org.mockito.ArgumentMatchers.<ConsumerRecord<byte[], byte[]>>argThat(
-                cr -> cr.topic().equals("t") && cr.offset() == 7L),
-            org.mockito.ArgumentMatchers.eq(AcknowledgeType.RELEASE));
-        assertThat(listenerCompleted.get()).isTrue();
+        assertThat(seenAck.get()).isNotNull();
+        assertThat(seenAck.get().deliveryCount())
+            .as("AckContext.deliveryCount() must delegate to the underlying ConsumerContext")
+            .isEqualTo(7);
+        assertThat(seenAck.get().orderingMode())
+            .as("AckContext.orderingMode() must delegate to the underlying ConsumerContext")
+            .isEqualTo(OrderingMode.KEY);
     }
+
+    // Task B2: the previous test here (manualInvokerDropsRenewAckWithWarnLog) verified that
+    // AckContext.acknowledge(AcknowledgeType.RENEW) was silently dropped with a WARN log.
+    // Plurima's public AckType enum (which now replaces Kafka's AcknowledgeType on
+    // AckContext#acknowledge / AckMessage#acknowledge) has no RENEW constant at all, so passing
+    // it is a compile error rather than a runtime no-op — the behavior this test pinned no
+    // longer exists to verify. See AckType's javadoc and ListenerInvoker.IdempotentAckContext
+    // (the sole AckType → Kafka AcknowledgeType mapping, which is now total).
 
     @Test
     void manualInvokerLateAsyncAckIsSwallowedAfterAutoRelease() throws Throwable {
@@ -198,7 +230,7 @@ class ListenerInvokerTest {
         invoker.invoke(r, ctxFor(r), coordinator);
 
         // Auto-RELEASE was queued. Now the user "remembers" and calls ack late:
-        escaped.get().acknowledge(AcknowledgeType.ACCEPT);
+        escaped.get().acknowledge(AckType.ACCEPT);
 
         coordinator.commitPendingAcks(consumer);
         // Only ONE ack should have been delivered to the consumer (the auto-RELEASE).

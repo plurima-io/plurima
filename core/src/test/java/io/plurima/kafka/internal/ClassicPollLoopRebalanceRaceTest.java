@@ -57,7 +57,7 @@ class ClassicPollLoopRebalanceRaceTest {
     private ClassicPollLoop<byte[], byte[]> newLoop(OrderingMode ordering) {
         RecordListener<byte[], byte[]> listener = (r, ctx) -> {};
         return new ClassicPollLoop<>(
-            consumer, "t", listener,
+            consumer, "t", "g1", listener,
             RecordDeserializer.bytes(), RecordDeserializer.bytes(),
             ordering,
             new RetryEngine(RetryPolicy.noRetry()),

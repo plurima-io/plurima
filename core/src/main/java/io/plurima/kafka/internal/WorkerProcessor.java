@@ -4,8 +4,8 @@ import io.plurima.kafka.ConsumerContext;
 import io.plurima.kafka.HandlerTimeoutException;
 import io.plurima.kafka.annotation.Internal;
 import io.plurima.kafka.metrics.PlurimaMetrics;
-import io.plurima.kafka.retry.RetryDecision;
 import org.apache.kafka.clients.consumer.AcknowledgeType;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -14,6 +14,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Internal
 public final class WorkerProcessor {
@@ -89,6 +90,21 @@ public final class WorkerProcessor {
 
     public void process(InFlightRecord<byte[], byte[]> r, ConsumerContext ctx) {
         while (true) {
+            // Per-attempt terminal-ack re-check — mirrors ClassicPollLoop.processOne's per-attempt
+            // ownership re-check. Inline retry backoff (retryAfter's Thread.sleep) can run for up
+            // to INLINE_THRESHOLD with the record still "in flight" from the drain barrier's point
+            // of view; PollLoop.forceReleaseStuckRecords() can fire during that sleep and queue a
+            // slowness RELEASE (AckCoordinator.queueReleaseForSlowness), which marks
+            // terminalAckQueued via the first-wins guard. Checking only once, after the PRECEDING
+            // invokeListener call failed (below), misses this: that check runs BEFORE the backoff
+            // sleep, not after, so a force-RELEASE landing during the sleep would otherwise go
+            // unnoticed and the loop would re-invoke the listener on a record Plurima has already
+            // abandoned to the broker. Re-checking at the top of every iteration closes that gap.
+            if (r.isTerminalAckQueued()) {
+                log.warn("Skipping retry re-invocation for {} — terminal ack already queued "
+                    + "(likely force-RELEASE by the drain barrier during retry backoff)", r.coord());
+                return;
+            }
             Throwable failure = invokeListener(r, ctx);
             if (failure == null) return;                          // success
             // Manual-ack listener that terminal-acked BEFORE throwing — the user's ack
@@ -108,60 +124,152 @@ public final class WorkerProcessor {
     }
 
     /**
+     * Lifecycle of a single handler invocation, guarded by an {@link AtomicReference} CAS so the
+     * watchdog and the worker can never both act on the same invocation.
+     *
+     * <ul>
+     *   <li>{@code RUNNING} — handler in flight; both parties may still transition it.</li>
+     *   <li>{@code DONE} — the worker settled first (handler returned or threw its own error).
+     *       The watchdog's {@code RUNNING→TIMED_OUT} CAS now fails, so it can NEVER interrupt
+     *       this thread. This is the guarantee the whole design exists to provide.</li>
+     *   <li>{@code TIMED_OUT} — the watchdog settled first; it (and only it) interrupts the
+     *       worker. The worker's {@code RUNNING→DONE} CAS fails, telling it a timeout occurred.</li>
+     * </ul>
+     */
+    private enum InvocationState { RUNNING, DONE, TIMED_OUT }
+
+    /**
      * Run the user listener once and emit accept-path metrics. Returns {@code null}
      * on success; on failure, returns the thrown cause so the caller can decide
      * retry / reject / DLT. The single try/catch over user code lives here.
+     *
+     * <p><b>Concurrency (A5 — watchdog cancel-race).</b> A {@link ScheduledFuture#cancel(boolean)
+     * cancel(false)} cannot stop an already-running watchdog task, so cancellation alone cannot
+     * decide "did the timeout fire?". Instead a per-invocation {@link AtomicReference} state gates
+     * both parties:
+     * <ul>
+     *   <li>The watchdog interrupts the worker <em>only</em> if it wins {@code RUNNING→TIMED_OUT}.</li>
+     *   <li>The worker settles with {@code RUNNING→DONE}. If it wins, the watchdog can no longer
+     *       win its CAS and therefore can never interrupt this thread — so no stray interrupt can
+     *       leak past this method into a later retry sleep or DLT wait. This is critical because
+     *       Task A4's classic DLT retry loop treats <em>any</em> interrupt as shutdown; the
+     *       watchdog must be provably unable to interrupt a worker outside this invocation window.</li>
+     *   <li>If the worker loses the settle CAS the watchdog won: an interrupt is (or is about to be)
+     *       delivered, so the worker waits until the watchdog has actually issued it
+     *       ({@code interruptIssued}) and then clears it, and only then is the failure classified
+     *       as {@link HandlerTimeoutException}.</li>
+     * </ul>
+     * A non-watchdog interrupt (e.g. shutdown) leaves the state {@code RUNNING→DONE} (the worker
+     * wins), so it is <em>not</em> cleared and correctly survives to abort {@code retryAfter()}'s
+     * sleep.
      */
-    private Throwable invokeListener(InFlightRecord<byte[], byte[]> r, ConsumerContext ctx) {
+    private @Nullable Throwable invokeListener(InFlightRecord<byte[], byte[]> r, ConsumerContext ctx) {
         long startNanos = System.nanoTime();
-        AtomicBoolean firedTimeout = new AtomicBoolean(false);
-        ScheduledFuture<?> watchdog = scheduleTimeout(firedTimeout);
+        AtomicReference<InvocationState> state = new AtomicReference<>(InvocationState.RUNNING);
+        AtomicBoolean interruptIssued = new AtomicBoolean(false);
+        ScheduledFuture<?> watchdog = scheduleTimeout(state, interruptIssued);
+
+        Throwable thrown = null;
+        // Tracks WHERE `thrown` originated. Only handler-invocation failures may be
+        // wrapped as HandlerTimeoutException below; a success-path plumbing failure
+        // (latency window / ACCEPT queueing) must be classified as itself even when
+        // the watchdog won the settle CAS — the handler SUCCEEDED, so reporting a
+        // "timeout" would send an already-completed record through user retry
+        // policies that re-invoke business logic on timeouts.
+        boolean handlerThrew = false;
         try {
             invoker.invoke(r, ctx, coordinator);
-            long elapsed = System.nanoTime() - startNanos;
-            metrics.recordProcessDuration(r.coord().topic(), Duration.ofNanos(elapsed));
-            if (latencyWindow != null) latencyWindow.record(elapsed);
-            if (!invoker.isManualAck()) {
-                // recordsProcessed is emitted inside coordinator.queueAck — centralised
-                // there so manual-ack ACCEPT/REJECT and auto-RELEASE-on-no-ack paths
-                // all count consistently.
-                coordinator.queueAck(r, AcknowledgeType.ACCEPT);
-            }
-            return null;
         } catch (Throwable t) {
-            metrics.recordProcessDuration(r.coord().topic(),
-                Duration.ofNanos(System.nanoTime() - startNanos));
-            // If our watchdog interrupted the handler, surface it as HandlerTimeoutException so
-            // the user's RetryPolicy can classify timeouts explicitly. Otherwise pass the cause through.
-            Throwable cause = firedTimeout.get()
-                ? new HandlerTimeoutException("handler exceeded timeout " + handlerTimeout, t)
-                : t;
-            metrics.recordsFailed(r.coord().topic(), cause.getClass().getName());
-            return cause;
-        } finally {
-            if (watchdog != null) {
-                watchdog.cancel(false);
-                // Consume ONLY our watchdog's interrupt (so a stray timeout interrupt can't leak
-                // into a later retry sleep). Crucially, do NOT clear when the watchdog did not fire:
-                // a non-timeout interrupt (e.g. shutdown interrupting the worker) must survive so
-                // retryAfter()'s Thread.sleep aborts instead of sleeping/retrying through shutdown.
-                if (firedTimeout.get()) {
-                    Thread.interrupted();
+            thrown = t;
+            handlerThrew = true;
+        }
+        long elapsed = System.nanoTime() - startNanos;
+
+        // Settle this invocation exactly once. Losing the CAS means the watchdog already won
+        // (state == TIMED_OUT) and is committed to interrupting this thread.
+        boolean timedOut = !state.compareAndSet(InvocationState.RUNNING, InvocationState.DONE);
+        if (watchdog != null) {
+            watchdog.cancel(false);   // best-effort: frees the scheduler slot if not yet started
+        }
+        if (timedOut) {
+            // The watchdog won and WILL call worker.interrupt(); it may still be between its
+            // winning CAS and that call, so spin until it signals the interrupt has been issued,
+            // then consume it. If the handler already absorbed the interrupt (e.g. an
+            // InterruptedException from a blocking call cleared the flag), Thread.interrupted()
+            // is simply a no-op. Either way, no interrupt survives past this point.
+            while (!interruptIssued.get()) {
+                Thread.onSpinWait();
+            }
+            Thread.interrupted();
+        }
+
+        // Recorded exactly once regardless of outcome: success, handler failure, or success-path
+        // plumbing failure (which falls through to the failure path below without looping back
+        // here).
+        metrics.recordProcessDuration(r.coord().topic(), Duration.ofNanos(elapsed));
+
+        if (thrown == null) {
+            try {
+                if (latencyWindow != null) latencyWindow.record(elapsed);
+                if (!invoker.isManualAck()) {
+                    // recordsProcessed is emitted inside coordinator.queueAck — centralised
+                    // there so manual-ack ACCEPT/REJECT and auto-RELEASE-on-no-ack paths
+                    // all count consistently.
+                    coordinator.queueAck(r, AcknowledgeType.ACCEPT);
                 }
+                return null;
+            } catch (Throwable plumbing) {
+                // Success-path plumbing (latency window / ACCEPT queueing) failed. Historically
+                // the single try/catch over the whole invocation caught this and routed it
+                // through failure classification (retry / reject / DLT) — preserve that rather
+                // than letting it propagate uncaught out of the worker. The invocation is
+                // already settled above (CAS + interrupt drain), so running this plumbing after
+                // settle does not weaken the watchdog guarantee at all: the watchdog still
+                // cannot interrupt this thread once DONE won. handlerThrew stays FALSE: this
+                // failure is infrastructure, not handler code — even if the watchdog won the
+                // settle CAS (timedOut == true), it must NOT be reported as a handler timeout.
+                thrown = plumbing;
             }
         }
+
+        // Classify as HandlerTimeoutException ONLY when the watchdog won the CAS AND the
+        // failure originated from the handler invocation itself — so the user's RetryPolicy
+        // can classify timeouts explicitly. Two deliberate exclusions:
+        //  - A handler that threw its own exception while the WORKER won the settle race
+        //    reports that ORIGINAL exception, never a timeout.
+        //  - A plumbing failure after a SUCCESSFUL handler (handlerThrew == false) reports
+        //    the plumbing exception itself even when timedOut is true — the record's
+        //    business logic completed, so a timeout classification would be a lie that
+        //    triggers re-invocation via timeout-retrying policies.
+        // The documented tradeoff stands for handler-origin exceptions during a real
+        // timeout: we can't distinguish "handler failed on its own" from "handler failed
+        // because the watchdog interrupted it", so the timeout wrapper (with the original
+        // as cause) wins.
+        Throwable cause = timedOut && handlerThrew
+            ? new HandlerTimeoutException("handler exceeded timeout " + handlerTimeout, thrown)
+            : thrown;
+        metrics.recordsFailed(r.coord().topic(), cause.getClass().getName());
+        return cause;
     }
 
     /**
-     * Schedules an interrupt of the current worker thread after {@code handlerTimeout}, recording
-     * that it fired via {@code firedTimeout}. Returns {@code null} when no timeout is configured.
+     * Schedules an interrupt of the current worker thread after {@code handlerTimeout}. The
+     * interrupt is issued <em>only</em> if the watchdog wins the {@code RUNNING→TIMED_OUT} CAS;
+     * {@code interruptIssued} is then set after {@link Thread#interrupt()} returns so the worker
+     * can wait for the interrupt to be delivered before clearing it. Returns {@code null} when no
+     * timeout is configured.
      */
-    private ScheduledFuture<?> scheduleTimeout(AtomicBoolean firedTimeout) {
+    private @Nullable ScheduledFuture<?> scheduleTimeout(
+        AtomicReference<InvocationState> state, AtomicBoolean interruptIssued) {
         if (handlerTimeout == null || timeoutScheduler == null) return null;
         Thread worker = Thread.currentThread();
         return timeoutScheduler.schedule(() -> {
-            firedTimeout.set(true);
-            worker.interrupt();
+            if (state.compareAndSet(InvocationState.RUNNING, InvocationState.TIMED_OUT)) {
+                worker.interrupt();
+                interruptIssued.set(true);
+            }
+            // Lost the CAS → the worker already settled (DONE); do NOT interrupt: a stray
+            // interrupt here would poison a later retry sleep or DLT wait.
         }, handlerTimeout.toNanos(), TimeUnit.NANOSECONDS);
     }
 

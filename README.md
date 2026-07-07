@@ -128,7 +128,7 @@ props.put("bootstrap.servers", "localhost:9092");
 props.put("group.id", "orders-share-group");
 props.put("share.acknowledgement.mode", "explicit");
 
-try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
     .kafkaProperties(props)
     .topic("orders")
     .concurrency(50)
@@ -149,10 +149,13 @@ For application code that should not depend on Kafka client types, prefer the
 ```java
 import io.plurima.kafka.Message;
 import io.plurima.kafka.PlurimaConsumer;
+import io.plurima.kafka.deserializer.RecordDeserializer;
 
-PlurimaConsumer.<String, Order>builder()
+PlurimaConsumer.builder()
     .kafkaProperties(props)
     .topic("orders")
+    .keyDeserializer(RecordDeserializer.utf8String())
+    .valueDeserializer((topic, bytes) -> objectMapper.readValue(bytes, Order.class))
     .onMessage((Message<String, Order> msg) -> {
         handleOrder(msg.key(), msg.value());
     })
@@ -167,7 +170,7 @@ import io.plurima.kafka.OrderingGuarantee;
 import io.plurima.kafka.OrderingMode;
 import io.plurima.kafka.PlurimaConsumer;
 
-PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
     .kafkaProperties(props)
     .topic("orders")
     .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -195,7 +198,7 @@ per-key FIFO semantics.
 import io.plurima.kafka.dlt.DltConfig;
 import io.plurima.kafka.retry.RetryPolicy;
 
-PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
     .kafkaProperties(props)
     .topic("orders")
     .retry(RetryPolicy.exponential()
@@ -205,7 +208,7 @@ PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>build
         .jitter(0.2)
         .retryOn(RuntimeException.class)
         .build())
-    .deadLetterTopic(DltConfig.builder()
+    .deadLetter(DltConfig.builder()
         .producerProperties(dltProducerProperties)
         .namingStrategy(topic -> topic + ".DLT")
         .build())
@@ -223,7 +226,7 @@ import io.plurima.kafka.metrics.MicrometerPlurimaMetrics;
 
 MicrometerPlurimaMetrics metrics = new MicrometerPlurimaMetrics(meterRegistry);
 
-PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
     .kafkaProperties(props)
     .topic("orders")
     .metrics(metrics)
@@ -247,7 +250,7 @@ import org.springframework.stereotype.Component;
 @Component
 class OrderListeners {
 
-    @PlurimaListener(topics = "orders", groupId = "orders-share-group", concurrency = 50)
+    @PlurimaListener(topics = "orders", groupId = "orders-share-group", concurrency = "50")
     void onOrder(ConsumerRecord<byte[], byte[]> record) {
         handleOrder(record.key(), record.value());
     }
@@ -255,7 +258,12 @@ class OrderListeners {
 ```
 
 The starter auto-discovers `RetryPolicy`, `DltConfig`, and `PlurimaMetrics` beans
-when they are present.
+when they are present. If `kafka-plurima-metrics` is on the runtime classpath and
+a `MeterRegistry` bean exists, a `MicrometerPlurimaMetrics` bean is auto-registered
+(unless you define your own `PlurimaMetrics` bean). Set `plurima.enabled=false` to
+switch the whole starter off (e.g. in test slices). `@PlurimaListener`'s `topics`,
+`groupId`, and `concurrency` attributes support Spring `${...}` property
+placeholders — `concurrency` is a `String` for exactly that reason.
 
 ## Documentation
 
@@ -264,8 +272,9 @@ when they are present.
 - [Benchmark Results](docs/Benchmarks.md): comparison with direct Kafka client
   implementations and interpretation of the measured results.
 - [CHANGELOG](CHANGELOG.md): release notes for published versions.
-- Javadocs: public API contracts for `PlurimaConsumer`, `ConsumerEngine`,
-  `OrderingMode`, `RetryPolicy`, `DltConfig`, and `PlurimaMetrics`.
+- [Javadocs](https://javadoc.io/doc/io.plurima/kafka-plurima-core): public API
+  contracts for `PlurimaConsumer`, `ConsumerEngine`, `OrderingMode`, `RetryPolicy`,
+  `DltConfig`, and `PlurimaMetrics`.
 
 ## Project Status
 
@@ -279,9 +288,8 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Trademark Notice
 
-KAFKA is a registered trademark of The Apache Software Foundation and has been
-licensed for use by Plurima. Plurima has no affiliation with and is not endorsed
-by The Apache Software Foundation.
+Apache Kafka and Kafka are registered trademarks of The Apache Software Foundation.
+Plurima is not affiliated with, endorsed, or sponsored by the ASF.
 
 See the [Apache Kafka trademark guidance](https://kafka.apache.org/community/trademark/).
 See [TRADEMARKS.md](TRADEMARKS.md) for the repository trademark notice.

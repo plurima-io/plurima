@@ -62,7 +62,7 @@ class ClassicMetricsIntegrationTest {
             }
         }
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -126,7 +126,7 @@ class ClassicMetricsIntegrationTest {
             .retryOn(RuntimeException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -192,13 +192,13 @@ class ClassicMetricsIntegrationTest {
             .build();
 
         AtomicInteger invocations = new AtomicInteger();
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
                 .ordering(OrderingMode.PARTITION)
                 .retry(policy)
-                .deadLetterTopic(dltConfig)
+                .deadLetter(dltConfig)
                 .pollTimeout(Duration.ofMillis(200))
                 .metrics(m)
                 .listener((r, ctx) -> {
@@ -249,7 +249,7 @@ class ClassicMetricsIntegrationTest {
         props.put("max.poll.records", "16");
 
         CountDownLatch done = new CountDownLatch(total);
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(props)
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -313,7 +313,7 @@ class ClassicMetricsIntegrationTest {
         @Override public void recordsPolled(String topic, int count) {
             c(polledMap, topic).addAndGet(count);
         }
-        @Override public void recordsProcessed(String topic, String result) {
+        @Override public void recordsProcessed(String topic, io.plurima.kafka.metrics.ProcessResult result) {
             c(processedMap, topic + "|" + result).incrementAndGet();
         }
         @Override public void recordsFailed(String topic, String exceptionClass) {
@@ -328,16 +328,16 @@ class ClassicMetricsIntegrationTest {
         @Override public void dltFailed(String topic, String cause) {
             c(dltFailedMap, topic + "|" + cause).incrementAndGet();
         }
-        @Override public void ackCommitted(String topic, String type) {
+        @Override public void ackCommitted(String topic, io.plurima.kafka.metrics.AckOutcome type) {
             c(ackCommittedMap, topic + "|" + type).incrementAndGet();
         }
         @Override public void ackCommitFailed(String topic, String exceptionClass) {
             c(ackCommitFailedMap, topic + "|" + exceptionClass).incrementAndGet();
         }
-        @Override public void backpressureEvent(String topic, String event) {
+        @Override public void backpressureEvent(String topic, io.plurima.kafka.metrics.BackpressureEvent event) {
             c(backpressureMap, topic + "|" + event).incrementAndGet();
         }
-        @Override public void recordPollDuration(Duration d) {
+        @Override public void recordPollDuration(String topic, String groupId, Duration d) {
             pollDurationCalls.incrementAndGet();
         }
         @Override public void recordProcessDuration(String topic, Duration d) {

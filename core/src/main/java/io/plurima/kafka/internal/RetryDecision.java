@@ -1,15 +1,15 @@
-package io.plurima.kafka.retry;
+package io.plurima.kafka.internal;
 
-import io.plurima.kafka.annotation.Stable;
+import io.plurima.kafka.annotation.Internal;
 
 import java.time.Duration;
 
 /**
- * Outcome of {@link io.plurima.kafka.internal.RetryEngine#evaluate} for a failed record.
+ * Outcome of {@link RetryEngine#evaluate} for a failed record.
  * Sealed: callers must handle all four cases. Engine-specific execution semantics are
  * documented per record below.
  */
-@Stable(since = "0.1.0")
+@Internal
 public sealed interface RetryDecision {
 
     /**
@@ -20,7 +20,7 @@ public sealed interface RetryDecision {
      *
      * @param delay sleep duration before the next listener invocation
      */
-    @Stable(since = "0.1.0")
+    @Internal
     record RetryInline(Duration delay) implements RetryDecision {}
 
     /**
@@ -46,7 +46,7 @@ public sealed interface RetryDecision {
      * @param delay backoff duration; honoured exactly on CLASSIC_BASIC,
      *     informational on SHARE (see above)
      */
-    @Stable(since = "0.1.0")
+    @Internal
     record RetryDelayed(Duration delay) implements RetryDecision {}
 
     /**
@@ -54,7 +54,7 @@ public sealed interface RetryDecision {
      *
      * @param cause the listener exception that triggered the rejection
      */
-    @Stable(since = "0.1.0")
+    @Internal
     record Reject(Throwable cause) implements RetryDecision {}
 
     /**
@@ -63,6 +63,6 @@ public sealed interface RetryDecision {
      *
      * @param cause the listener exception that ended the retry attempts
      */
-    @Stable(since = "0.1.0")
+    @Internal
     record Exhausted(Throwable cause) implements RetryDecision {}
 }

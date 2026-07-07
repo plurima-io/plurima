@@ -5,8 +5,10 @@ import io.plurima.kafka.annotation.Stable;
 /**
  * Explicit-ack listener over an {@link AckMessage}. The handler MUST call one of
  * {@link AckMessage#acknowledge}, {@link AckMessage#accept()}, {@link AckMessage#release()},
- * or {@link AckMessage#reject()} (a return without acking auto-RELEASEs, same as
- * {@link ManualAckListener}). A thrown exception is routed through the retry/DLT pipeline.
+ * or {@link AckMessage#reject()}. A thrown exception is routed through the retry/DLT pipeline.
+ *
+ * <p>returning without acknowledging auto-RELEASEs; the first acknowledgement wins and
+ * subsequent calls are no-ops.
  *
  * @param <K> deserialized key type
  * @param <V> deserialized value type

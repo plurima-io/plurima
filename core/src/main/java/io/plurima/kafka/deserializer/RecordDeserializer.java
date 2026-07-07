@@ -1,6 +1,7 @@
 package io.plurima.kafka.deserializer;
 
 import io.plurima.kafka.annotation.Stable;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Converts a raw byte array (as delivered by the Kafka broker) into a typed value.
@@ -23,7 +24,7 @@ public interface RecordDeserializer<T> {
      * @param data raw bytes from the broker, may be {@code null}
      * @return the deserialized value, or {@code null} if {@code data} was {@code null}
      */
-    T deserialize(String topic, byte[] data);
+    @Nullable T deserialize(String topic, byte @Nullable [] data);
 
     /**
      * Cached identity-deserializer singleton. Internal code can compare by reference

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -324,6 +325,67 @@ class ClassicKeyShardDispatcherTest {
         assertThat(seen.get())
             .as("seen-count must equal dispatch count")
             .isEqualTo(totalRecords);
+    }
+
+    @Test
+    void launchRejectionDrainsDeepQueueIteratively() throws Exception {
+        // launchNext recurses on TWO sites: the busy-release double-check, and the
+        // per-entry launch-rejection recovery. This test targets the second site with
+        // a deep backlog: a worker holds the shard busy while 200k entries queue up
+        // behind it, then the launcher is shut down so EVERY subsequent launch()
+        // throws RejectedExecutionException. When the blocked worker finally finishes
+        // and calls launchNext, the old recursive implementation would recurse once
+        // per queued entry on a single thread — a real stack-depth hazard. The fix
+        // makes launchNext iterative so depth is O(1) regardless of backlog size.
+        TopicPartition tp = new TopicPartition("t", 0);
+        WorkerLauncher rejectingLauncher = new WorkerLauncher();
+
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        int deepQueueSize = 200_000;
+        AtomicInteger doneCount = new AtomicInteger();
+        CountDownLatch done = new CountDownLatch(deepQueueSize + 1);
+
+        ClassicRecordProcessor processOne = (fr, t, r) -> {
+            if (r.offset() == 0) {
+                started.countDown();
+                try { release.await(10, TimeUnit.SECONDS); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+            // Records after offset 0 are never actually reached here — once the
+            // launcher is shut down below, every launch() attempt for them is
+            // rejected before processOne would run.
+        };
+
+        ClassicKeyShardDispatcher d = new ClassicKeyShardDispatcher(
+            1, rejectingLauncher, processOne, () -> true);
+
+        // Record 0 claims the shard and blocks in processOne, holding busy=true so
+        // the backlog below just accumulates without triggering launchNext yet.
+        d.dispatch(tp, new CommitFrontier(),
+            List.of(rec(tp, 0, "k0")),
+            () -> { doneCount.incrementAndGet(); done.countDown(); });
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+
+        List<ConsumerRecord<byte[], byte[]>> backlog = new ArrayList<>(deepQueueSize);
+        for (int i = 1; i <= deepQueueSize; i++) {
+            backlog.add(rec(tp, i, "k" + i));
+        }
+        d.dispatch(tp, new CommitFrontier(), backlog,
+            () -> { doneCount.incrementAndGet(); done.countDown(); });
+
+        // Shut the launcher down NOW so every subsequent launch() throws
+        // RejectedExecutionException, then release the blocked worker. Its finally
+        // block calls launchNext, which must drain the entire 200k backlog through
+        // the rejection-recovery path in one go.
+        rejectingLauncher.close(Duration.ZERO);
+        release.countDown();
+
+        assertThat(done.await(30, TimeUnit.SECONDS))
+            .as("every record's onRecordDone must fire, and draining a deep "
+                + "launch-rejection backlog must not stack-overflow the worker thread")
+            .isTrue();
+        assertThat(doneCount.get()).isEqualTo(deepQueueSize + 1);
     }
 
     @Test

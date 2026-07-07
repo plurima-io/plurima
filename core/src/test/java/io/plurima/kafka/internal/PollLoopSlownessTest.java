@@ -39,7 +39,7 @@ class PollLoopSlownessTest {
         loop = new PollLoop(
             consumer, noop, coordinator, registry, gate,
             Duration.ofMillis(40), barrier, Duration.ofSeconds(2), barrier,
-            PlurimaMetrics.noOp(), "t", null, null, null, /*lockDurationExplicitlySet*/ true);
+            PlurimaMetrics.noOp(), "t", "g1", null, null, null, /*lockDurationExplicitlySet*/ true);
 
         consumer.enqueue(new ConsumerRecord<>("t", 0, 7L, new byte[0], new byte[0]));
 

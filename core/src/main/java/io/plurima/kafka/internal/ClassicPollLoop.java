@@ -4,8 +4,11 @@ import io.plurima.kafka.OrderingMode;
 import io.plurima.kafka.RecordListener;
 import io.plurima.kafka.annotation.Internal;
 import io.plurima.kafka.deserializer.RecordDeserializer;
+import io.plurima.kafka.metrics.AckOutcome;
+import io.plurima.kafka.metrics.BackpressureEvent;
 import io.plurima.kafka.metrics.PlurimaMetrics;
-import io.plurima.kafka.retry.RetryDecision;
+import io.plurima.kafka.metrics.ProcessResult;
+import org.apache.kafka.clients.consumer.CloseOptions;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -13,6 +16,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -20,15 +24,18 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiPredicate;
+import java.util.function.Consumer;
 
 /**
  * Poll loop for the CLASSIC_BASIC engine. Continuous-poll model with intra-partition
@@ -73,8 +80,12 @@ import java.util.function.BiPredicate;
  *   <li>Reject → frontier.complete (skip).</li>
  *   <li>Exhausted + DLT → produce to DLT, then frontier.complete on success.
  *       On DLT publish failure the frontier is NOT advanced (commit stalls at the
- *       failing offset until DLT is healthy; restart redelivers). Alert on
- *       {@code plurima.consumer.dlt.failures}.</li>
+ *       failing offset until DLT is healthy; restart redelivers), AND the partition
+ *       is paused (independently of backpressure — see {@link #pausedByDltFailure})
+ *       while the failing worker retries the publish with capped exponential
+ *       backoff. This bounds {@code completedAhead} growth during a DLT outage
+ *       instead of letting it grow unboundedly while later offsets keep completing.
+ *       Alert on {@code plurima.consumer.dlt.failures}.</li>
  *   <li>Exhausted, no DLT → log ERROR + frontier.complete (lossy by configuration —
  *       record dropped, {@code plurima.consumer.records.processed{result=reject}}).</li>
  * </ul>
@@ -86,6 +97,8 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
 
     private final KafkaConsumer<byte[], byte[]> consumer;
     private final String topic;
+    /** Consumer group id, for the {@code group_id} tag on {@code plurima.consumer.poll.duration}. */
+    private final String groupId;
     private final RecordListener<K, V> listener;
     private final RecordDeserializer<K> keyDeser;
     private final RecordDeserializer<V> valueDeser;
@@ -111,6 +124,17 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
      * self-join-safe (must not join the poll thread back to itself).
      */
     private final Runnable onLoopExit;
+    /**
+     * Fatal-error hook (B6). Invoked from {@link #run()}'s finally block ONLY when the
+     * loop exited via the generic {@code catch (Throwable t)} branch below — i.e. an
+     * unrecoverable error, not a normal shutdown — and only in place of (never in
+     * addition to) {@link #onLoopExit}. {@code null} for legacy/test constructors that
+     * don't wire one up; in that case {@link #onLoopExit} still fires on the fatal path
+     * so cleanup is never skipped, just without the state-transition/callback semantics
+     * {@code ClassicBasicRuntime.handleFatal} adds. Mirrors {@code PollLoop.onFatal} —
+     * see there for the SHARE-engine analogue.
+     */
+    private final Consumer<Throwable> onFatal;
 
     /**
      * Per-partition commit frontier. Each frontier tracks the smallest offset NOT yet
@@ -210,6 +234,139 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
     /** Whether we have actively paused for backpressure. Avoids re-pausing every iteration. */
     private volatile boolean backpressureActive = false;
 
+    /**
+     * Per-partition DLT-pause holds: a partition is paused for DLT failure while ANY
+     * worker is retrying a failed DLT publish for it, so the value is a per-worker
+     * refcount scoped to the partition's frontier generation. <b>Deliberately independent
+     * of {@link #pausedByBackpressure}.</b> A single partition may be paused for BOTH
+     * reasons at once, and each reason has its own resume trigger:
+     * <ul>
+     *   <li>Backpressure resumes when the in-flight count drains — but its resume path
+     *       ({@link #applyBackpressure}) explicitly excludes anything still held here,
+     *       so a drop in in-flight can never resume a partition whose DLT is still down.</li>
+     *   <li>A DLT-failure pause resumes only when the LAST retrying worker's publish
+     *       succeeds (or the partition is revoked/lost), which removes the entry here;
+     *       {@link #applyDltFailurePause} then issues the {@code consumer.resume}.</li>
+     * </ul>
+     *
+     * <p><b>Why a refcount, not plain set membership.</b> With UNORDERED (or KEY)
+     * ordering, several workers on the SAME partition can be inside
+     * {@link #pauseAndRetryDlt}'s retry loop concurrently. A plain set entry would be
+     * removed by the FIRST worker to succeed, resuming the partition while the others are
+     * still retrying — and they never re-add it, so {@code completedAhead} would grow
+     * unboundedly for the rest of the outage (the exact condition this pause exists to
+     * prevent). Each worker instead increments on retry-loop entry and decrements exactly
+     * once on exit (success, abort, shutdown); the entry — and thus the pause — only
+     * clears at refcount zero.
+     *
+     * <p><b>Why generation-scoped.</b> Revoke (or lost) clears a partition's entry
+     * ENTIRELY via {@link #pausedByDltFailure}{@code .removeAll} — all of the old
+     * generation's holds vanish at once, matching the frontier removal that makes those
+     * workers abort. If the partition is then reassigned and a NEW generation's worker
+     * re-acquires a hold, a straggling old-generation worker's late decrement must not
+     * release the new generation's pause: {@link #releaseDltPause} only decrements when
+     * the hold's recorded frontier is identical to the caller's, and
+     * {@link #acquireDltPause} only replaces a stale different-generation hold when the
+     * CALLER is the live generation — a stale caller leaves an existing (possibly newer,
+     * live) hold untouched instead of clobbering it.
+     *
+     * <p><b>Threading.</b> Mutated by WORKER threads via {@link #acquireDltPause} /
+     * {@link #releaseDltPause}; cleared wholesale by the rebalance listener (poll thread)
+     * and {@code run()}'s shutdown finally. Read by the POLL thread in
+     * {@link #applyDltFailurePause} and {@link #applyBackpressure} through the
+     * {@link #pausedByDltFailure} key-set view. Only the poll thread ever calls
+     * {@code consumer.pause/resume} — workers never touch the (non-thread-safe) consumer.
+     */
+    private final ConcurrentMap<TopicPartition, DltPauseHold> dltPauseHolds = new ConcurrentHashMap<>();
+
+    /**
+     * Live key-set view of {@link #dltPauseHolds} — the "desired DLT-paused" partitions.
+     * The poll thread's pause/resume reconciliation ({@link #applyDltFailurePause},
+     * {@link #applyBackpressure}) reads it; {@link ClassicRebalanceListener} and
+     * {@link #simulateRevoke} call {@code removeAll} on it, which drops the underlying
+     * refcount entries entirely (revoke releases every worker's hold at once — their own
+     * generation-guarded releases then no-op). Never added to directly: workers acquire
+     * holds through {@link #acquireDltPause} only.
+     */
+    private final Set<TopicPartition> pausedByDltFailure = dltPauseHolds.keySet();
+
+    /**
+     * One partition's aggregate DLT-pause hold: how many workers of {@code generation}
+     * (the frontier instance captured at their dispatch) are currently inside the DLT
+     * retry loop. Immutable — {@link #acquireDltPause}/{@link #releaseDltPause} swap
+     * whole instances inside atomic {@code compute} operations.
+     */
+    private record DltPauseHold(CommitFrontier generation, int count) {}
+
+    /**
+     * Register this worker's DLT-pause hold for {@code tp} (increment the refcount).
+     * A leftover hold from a DIFFERENT generation is replaced ONLY IF the caller itself
+     * is the live generation ({@code frontiers.get(tp) == frontier}): that is the normal
+     * revoke+reassign race, where the old-generation owners are aborting and their
+     * generation-guarded releases will skip the new hold. A STALE caller (its own
+     * generation no longer live) must NOT clobber whatever hold is there — most
+     * dangerously, a live NEWER generation's hold — because a stale caller has no
+     * standing to mutate a pause it doesn't own; it just leaves the existing hold
+     * untouched and falls through to its own (no-op) release later. This mirrors
+     * {@link #releaseDltPause}'s generation guard: both acquire and release must be
+     * safe against stale-generation stragglers waking up after reassignment.
+     */
+    private void acquireDltPause(TopicPartition tp, CommitFrontier frontier) {
+        dltPauseHolds.compute(tp, (k, hold) -> {
+            if (hold != null && hold.generation() == frontier) {
+                return new DltPauseHold(frontier, hold.count() + 1);
+            }
+            if (hold != null && frontiers.get(tp) != frontier) {
+                // Caller is stale (not the live generation) — leave the existing hold
+                // (whoever owns it) untouched rather than clobbering it.
+                return hold;
+            }
+            return new DltPauseHold(frontier, 1);
+        });
+    }
+
+    /**
+     * Release this worker's DLT-pause hold (decrement-and-remove-at-zero). No-ops when
+     * the entry is gone (revoke already cleared it) or belongs to a NEWER generation
+     * (revoke cleared ours, reassign + a new failure re-acquired it) — a stale worker
+     * must never lift a pause it no longer owns.
+     */
+    private void releaseDltPause(TopicPartition tp, CommitFrontier frontier) {
+        dltPauseHolds.computeIfPresent(tp, (k, hold) -> {
+            if (hold.generation() != frontier) return hold;  // not our hold — leave it
+            return hold.count() <= 1 ? null : new DltPauseHold(frontier, hold.count() - 1);
+        });
+    }
+
+    /**
+     * Poll-thread-ONLY mirror of which partitions {@link #applyDltFailurePause} has
+     * actually issued {@code consumer.pause} for. The reconcile step diffs this against
+     * {@link #pausedByDltFailure}: entries present there but not here are newly-failed
+     * (pause them); entries here but no longer there had their worker recover (resume
+     * them). Plain {@link HashSet} — never touched off the poll thread.
+     */
+    private final Set<TopicPartition> dltPauseApplied = new HashSet<>();
+
+    /**
+     * DLT-publish retry backoff, capped exponential with jitter. Defaults per design:
+     * 1s start, 30s cap. {@code volatile} + package-private so
+     * {@code ClassicDltFailureBackpressureTest} can shrink them for fast, deterministic
+     * runs without a broker. Never mutated in production.
+     */
+    private volatile long dltRetryBaseMs = 1_000L;
+    private volatile long dltRetryCapMs = 30_000L;
+
+    /**
+     * Per-attempt budget {@link #publishToDlt} waits on {@code route.future().get(...)}
+     * before giving up and treating the attempt as a caller-side timeout. 30s in
+     * production (matches the client's default request timeout order of magnitude);
+     * {@code volatile} + package-private purely as a test seam — see
+     * {@link #setDltPublishBudgetForTest} — so tests can force the caller-side
+     * give-up path deterministically without actually blocking 30 real seconds. Never
+     * mutated in production.
+     */
+    private volatile long dltPublishBudgetMs = 30_000L;
+
     private volatile boolean running = true;
 
     /**
@@ -235,6 +392,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
     ClassicPollLoop(
         KafkaConsumer<byte[], byte[]> consumer,
         String topic,
+        String groupId,
         RecordListener<K, V> listener,
         RecordDeserializer<K> keyDeser,
         RecordDeserializer<V> valueDeser,
@@ -248,8 +406,37 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         PlurimaMetrics metrics,
         WorkerLauncher launcher,
         Runnable onLoopExit) {
+        this(consumer, topic, groupId, listener, keyDeser, valueDeser, ordering, retryEngine, dltRouter,
+            pollTimeout, shutdownDrainTimeoutMs, concurrency, shardCount, metrics, launcher,
+            onLoopExit, null);
+    }
+
+    /**
+     * Full constructor including the fatal-error hook (B6). {@code onFatal} is wired by
+     * {@code ClassicBasicRuntime} to its {@code handleFatal} method; see {@link #onFatal}
+     * for exactly when it fires relative to {@link #onLoopExit}.
+     */
+    ClassicPollLoop(
+        KafkaConsumer<byte[], byte[]> consumer,
+        String topic,
+        String groupId,
+        RecordListener<K, V> listener,
+        RecordDeserializer<K> keyDeser,
+        RecordDeserializer<V> valueDeser,
+        OrderingMode ordering,
+        RetryEngine retryEngine,
+        DltRouter dltRouter,
+        Duration pollTimeout,
+        long shutdownDrainTimeoutMs,
+        int concurrency,
+        int shardCount,
+        PlurimaMetrics metrics,
+        WorkerLauncher launcher,
+        Runnable onLoopExit,
+        Consumer<Throwable> onFatal) {
         this.consumer = consumer;
         this.topic = topic;
+        this.groupId = groupId;
         this.listener = listener;
         this.keyDeser = keyDeser;
         this.valueDeser = valueDeser;
@@ -265,6 +452,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         this.metrics = metrics;
         this.launcher = launcher;
         this.onLoopExit = onLoopExit;
+        this.onFatal = onFatal;
         // stillOwned: returns true iff the partition's commit frontier is still the
         // same instance we captured at dispatch time. If revoke happened (frontier
         // removed) or revoke+reassign happened (a new frontier installed for the
@@ -284,9 +472,12 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             // the out-of-order completion arithmetic safely.
             case UNORDERED -> new ClassicUnorderedDispatcher(
                 launcher, this::processOne, () -> running, stillOwned);
-            // PARTITION dispatches a single worker per partition's batch; records
-            // process in offset order within the partition. Cross-cluster per-partition
-            // FIFO comes from classic consumer-group exclusive partition ownership.
+            // PARTITION routes every record through a persistent per-partition worker
+            // chain: one worker at a time drains the partition's queue, so records
+            // process serially in offset order ACROSS poll batches (cross-batch FIFO),
+            // while distinct partitions still run concurrently. Cross-cluster
+            // per-partition FIFO comes from classic consumer-group exclusive partition
+            // ownership.
             case PARTITION -> new ClassicPartitionSerialDispatcher(
                 launcher, this::processOne, () -> running, stillOwned);
         };
@@ -294,9 +485,15 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
 
     @Override
     public void run() {
+        Throwable fatal = null;
         try {
             while (running) {
                 applyBackpressure();
+                // Reconcile DLT-failure pauses AFTER backpressure so a DLT pause always
+                // has the final say for this iteration (backpressure's resume path
+                // deliberately leaves DLT-paused partitions paused; this step also
+                // resumes any whose worker just recovered).
+                applyDltFailurePause();
 
                 ConsumerRecords<byte[], byte[]> batch;
                 long pollStartNanos = System.nanoTime();
@@ -308,7 +505,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
                     break;
                 }
                 metrics.recordPollDuration(
-                    Duration.ofNanos(System.nanoTime() - pollStartNanos));
+                    topic, groupId, Duration.ofNanos(System.nanoTime() - pollStartNanos));
 
                 if (!batch.isEmpty()) {
                     for (TopicPartition tp : batch.partitions()) {
@@ -325,28 +522,110 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             }
         } catch (Throwable t) {
             log.error("Fatal error in ClassicPollLoop; consumer will stop", t);
+            fatal = t;
         } finally {
-            // Shutdown drain: wait up to shutdownDrainTimeout for in-flight workers to
-            // finish so their offsets can commit. Handlers within the drain budget land
-            // their commits; handlers exceeding it get abandoned with a WARN and their
-            // records redeliver to the next owner of the partitions.
-            shutdownDrain();
+            // Shared close deadline — mirrors PollLoop.drainAndClose() (the SHARE engine's
+            // analogous shutdown path). Drain, final commit, AND consumer.close() together
+            // must not exceed shutdownDrainTimeoutMs, matching the budget
+            // ClassicBasicRuntime.close() waits on when it joins this thread
+            // (shutdownDrainTimeout + 5s of padding). Previously each phase drew its OWN
+            // full budget: shutdownDrain() computed a fresh shutdownDrainTimeoutMs-long
+            // deadline, then drainPendingCommitsSync() blocked on the client's UNBOUNDED
+            // default commitSync timeout, then consumer.close() blocked on the client's
+            // UNBOUNDED default close timeout. Worst case that's the configured drain
+            // budget PLUS two independent unbounded blocking calls — easily exceeding the
+            // runtime's join padding and leaving the non-daemon poll thread running in the
+            // background after the runtime's close() had already returned.
+            //
+            // Both exit paths must converge on running == false BEFORE the drain below.
+            // A normal shutdown() already flipped it; the fatal path (generic
+            // catch (Throwable) above) reaches here with running still TRUE — the flag is
+            // otherwise only flipped later, by handleFatal → doClose → shutdown(), which
+            // runs AFTER this whole finally block. Without this write, a worker parked in
+            // pauseAndRetryDlt's while (running) retry loop (or processOne's retry loop)
+            // keeps retrying and pins inFlight for the entire drain slice, starving the
+            // final commit down to its floor. Flipping it here lets every worker observe
+            // shutdown at its next check and unwind promptly. Nothing below this point
+            // reads running as "still live": shutdownDrain only watches inFlight, and the
+            // commit/close phases don't consult the flag at all.
+            running = false;
+            // One overall deadline computed once. The TAIL phases are reserved UP FRONT:
+            // the drain may consume at most (overall − COMMIT_RESERVE − CLOSE_FLOOR), so
+            // even a drain that exhausts its whole slice leaves the final commitSync a
+            // meaningful ~COMMIT_RESERVE budget rather than starving it to the 2s close
+            // floor (a routinely slow drain would otherwise turn every such shutdown's
+            // final commit into a coin flip → avoidable duplicates on restart). Each
+            // subsequent phase then gets whatever's left of the shared deadline, floored
+            // so the broker always sees some attempt — see remainingBudget.
+            long deadlineNanos = System.nanoTime() + shutdownDrainTimeoutMs * 1_000_000L;
+            shutdownDrain(deadlineNanos - COMMIT_RESERVE.toNanos() - CLOSE_FLOOR.toNanos());
+            // Drop DLT-pause bookkeeping on the way out (close clears the set, per design).
+            // Workers still in a DLT retry loop observe running==false and stop on their
+            // own; clearing here just keeps the state tidy for any post-shutdown inspection.
+            pausedByDltFailure.clear();
+            dltPauseApplied.clear();
             // SYNC commit on shutdown so a transient broker hiccup on the FINAL commit
             // can't silently leave the last batch unpersisted and cause avoidable
             // duplicates on restart. drainPendingCommits (async) is fine for steady-
             // state — newer commits subsume older — but the last call has nothing
-            // following to subsume a failed earlier attempt.
-            drainPendingCommitsSync();
+            // following to subsume a failed earlier attempt. Bounded by what's left of
+            // the shared deadline (minus the CLOSE_FLOOR still owed to consumer.close
+            // below) rather than the client's default; floored at COMMIT_RESERVE so the
+            // up-front reservation above is honored even when the drain overshoots its
+            // slice by a scheduling tick.
+            drainPendingCommitsSync(
+                remainingBudget(deadlineNanos - CLOSE_FLOOR.toNanos(), COMMIT_RESERVE));
             // CRITICAL: close the consumer HERE on the poll thread. KafkaConsumer is
             // not thread-safe; closing it from the user thread (via the runtime's
             // close()) while this thread is still inside commitSync would race the
             // consumer's own thread-safety guard and could leak the underlying
             // socket. By closing on the poll thread we guarantee no concurrent
             // access. The runtime's close() just waits for this thread to finish.
-            RuntimeCleanup.logIfRaised("KafkaConsumer", consumer::close);
-            if (onLoopExit != null) RuntimeCleanup.logIfRaised("onLoopExit callback", onLoopExit::run);
+            // Bounded by what's LEFT of the shared deadline after the drain + commit
+            // phases above — not a fresh budget of its own.
+            RuntimeCleanup.logIfRaised("KafkaConsumer",
+                () -> consumer.close(CloseOptions.timeout(remainingBudget(deadlineNanos, CLOSE_FLOOR))));
+            if (fatal != null && onFatal != null) {
+                // onFatal (ClassicBasicRuntime.handleFatal) performs the equivalent of
+                // onLoopExit's cleanup itself (it shares the same doClose() body), plus
+                // the FAILED-state transition and the user's onFatalError callback, in
+                // that order. Calling onLoopExit here too would be redundant (and would
+                // race the state transition — see the class-level note on onFatal).
+                Throwable f = fatal;
+                RuntimeCleanup.logIfRaised("onFatal callback", () -> onFatal.accept(f));
+            } else if (onLoopExit != null) {
+                RuntimeCleanup.logIfRaised("onLoopExit callback", onLoopExit::run);
+            }
         }
     }
+
+    /**
+     * Time remaining until {@code deadlineNanos}, floored at {@code floor} so the broker
+     * always sees some attempt even when an earlier phase consumed the entire shutdown
+     * budget. Mirrors {@code PollLoop.remainingBudget} for the SHARE engine, generalized
+     * to a caller-supplied floor: the final commit floors at {@link #COMMIT_RESERVE}
+     * (matching its up-front reservation), the consumer close at {@link #CLOSE_FLOOR}.
+     */
+    private static Duration remainingBudget(long deadlineNanos, Duration floor) {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos < floor.toNanos()) return floor;
+        return Duration.ofNanos(remainingNanos);
+    }
+
+    /**
+     * Minimum budget reserved UP FRONT for the final shutdown {@code commitSync}: the
+     * drain phase's deadline is shortened by this (plus {@link #CLOSE_FLOOR}) so a drain
+     * that exhausts its whole slice can never starve the last commit down to the close
+     * floor. 5s is deliberately generous relative to {@code CLOSE_FLOOR} — a failed final
+     * commit costs duplicate processing on restart, a slightly shorter drain merely
+     * abandons still-running handlers a few seconds earlier (they redeliver either way).
+     * For configured drain budgets smaller than {@code COMMIT_RESERVE + CLOSE_FLOOR} the
+     * drain slice degenerates to zero and the two floors dominate the total shutdown
+     * time, mirroring how {@code CLOSE_FLOOR} already behaved.
+     */
+    private static final Duration COMMIT_RESERVE = Duration.ofSeconds(5);
+
+    private static final Duration CLOSE_FLOOR = Duration.ofSeconds(2);
 
     /**
      * Pause assigned partitions when in-flight count saturates; resume when it drains.
@@ -373,7 +652,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             pausedByBackpressure.addAll(toPause);
             if (!backpressureActive) {
                 backpressureActive = true;
-                metrics.backpressureEvent(topic, "paused");
+                metrics.backpressureEvent(topic, BackpressureEvent.PAUSED);
                 log.debug("backpressure: paused {} partitions (inFlight={} >= concurrency={})",
                     toPause.size(), n, concurrency);
             } else {
@@ -386,24 +665,96 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             }
         } else if (backpressureActive && n <= concurrency / 2) {
             if (!pausedByBackpressure.isEmpty()) {
-                consumer.resume(pausedByBackpressure);
+                // Resume everything backpressure paused EXCEPT partitions a DLT-publish
+                // failure is still holding down. The two pause reasons are independent:
+                // a partition paused for both must stay paused until BOTH clear, and only
+                // the DLT worker's success (or a revoke) is allowed to lift the DLT pause
+                // — never a drop in the in-flight count. applyDltFailurePause tracks those
+                // held-down partitions in dltPauseApplied and resumes them when the worker
+                // recovers, so excluding them here can't strand them paused forever.
+                Set<TopicPartition> toResume = new HashSet<>(pausedByBackpressure);
                 pausedByBackpressure.clear();
+                toResume.removeAll(pausedByDltFailure);
+                if (!toResume.isEmpty()) {
+                    consumer.resume(toResume);
+                }
             }
             backpressureActive = false;
             log.debug("backpressure: resumed (inFlight={} <= concurrency/2={})", n, concurrency / 2);
-            metrics.backpressureEvent(topic, "resumed");
+            metrics.backpressureEvent(topic, BackpressureEvent.RESUMED);
         }
     }
 
-    private void dispatchBatchAsync(ConsumerRecords<byte[], byte[]> batch) {
+    /**
+     * Reconcile DLT-failure pauses on the poll thread. {@link #pausedByDltFailure} is the
+     * desired-paused set written by worker threads; {@link #dltPauseApplied} mirrors what
+     * this method has actually paused. The diff drives two actions:
+     *
+     * <ul>
+     *   <li><b>New failures</b> — in {@code pausedByDltFailure} but not yet in
+     *       {@code dltPauseApplied}: pause the partition (idempotent even if backpressure
+     *       already paused it) and record it as applied.</li>
+     *   <li><b>Recoveries</b> — in {@code dltPauseApplied} but no longer in
+     *       {@code pausedByDltFailure} (the worker published successfully, or the partition
+     *       was revoked): drop the mirror entry and resume the partition, but ONLY if
+     *       backpressure isn't still holding it paused and we still own it. Resuming a
+     *       backpressure-paused partition here would defeat the backpressure gate.</li>
+     * </ul>
+     *
+     * <p>Only the poll thread calls {@code consumer.pause/resume} — KafkaConsumer is not
+     * thread-safe, and workers only ever mutate the concurrent {@code pausedByDltFailure}
+     * set, never the consumer.
+     */
+    private void applyDltFailurePause() {
+        if (pausedByDltFailure.isEmpty() && dltPauseApplied.isEmpty()) {
+            return;  // fast path — no DLT trouble in progress
+        }
+        Set<TopicPartition> assignment = consumer.assignment();
+        // Pause newly-failed partitions.
+        for (TopicPartition tp : pausedByDltFailure) {
+            if (assignment.contains(tp) && dltPauseApplied.add(tp)) {
+                consumer.pause(List.of(tp));
+                log.warn("DLT publish failing for {} — paused partition; a worker is retrying "
+                    + "the publish with backoff. Commits hold at the failing offset until it "
+                    + "recovers (alert on plurima.consumer.dlt.failures).", tp);
+            }
+        }
+        // Resume partitions whose worker recovered (or that were revoked).
+        if (!dltPauseApplied.isEmpty()) {
+            Iterator<TopicPartition> it = dltPauseApplied.iterator();
+            while (it.hasNext()) {
+                TopicPartition tp = it.next();
+                if (pausedByDltFailure.contains(tp)) {
+                    continue;  // still failing — leave paused
+                }
+                it.remove();
+                if (!pausedByBackpressure.contains(tp) && assignment.contains(tp)) {
+                    consumer.resume(List.of(tp));
+                    log.info("DLT publish recovered for {} — resumed partition.", tp);
+                }
+            }
+        }
+    }
+
+    // Package-private (was private) as a test seam: ClassicDltFailureBackpressureTest
+    // dispatches a real batch to drive a worker through processOne → handleExhaustion
+    // without spinning up the whole poll thread. Production callers are all in-class.
+    void dispatchBatchAsync(ConsumerRecords<byte[], byte[]> batch) {
         for (TopicPartition tp : batch.partitions()) {
             List<ConsumerRecord<byte[], byte[]>> records = batch.records(tp);
-            // Pin the frontier's starting offset to the first record we're about to dispatch
-            // for this partition. Without observe(), a partition that's never seen a record
-            // before would have an uninitialised frontier; the first complete() call would
-            // initialise it to the just-completed offset, which is correct only when there
-            // are no gaps below — true in classic-consumer batch ordering, but observe() is
-            // the explicit contract.
+            // Register EVERY record's offset with the frontier before dispatching the
+            // batch. The frontier matches completions against the offsets that were
+            // actually DELIVERED — not against arithmetic successors — because offsets
+            // are not dense: compacted topics drop records and read_committed skips
+            // transaction markers / aborted batches. Observing only the first offset
+            // would leave the frontier waiting forever for a phantom "next" offset
+            // that no worker will ever complete, permanently stalling commits.
+            //
+            // Ordering matters twice over: (a) observe() must see offsets in delivery
+            // order (the frontier's delivered-queue relies on it), which batch.records(tp)
+            // guarantees; (b) ALL observe() calls must precede dispatch, so a worker's
+            // complete() can never arrive for an offset the frontier hasn't seen
+            // delivered. Both observe() and this loop run on the poll thread only.
             //
             // We hold the frontier REFERENCE (not just the TopicPartition) and pass it to
             // the dispatcher. Workers carry the reference through to markComplete, which
@@ -411,7 +762,9 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             // mid-flight, a new CommitFrontier instance replaces this one in the map, and
             // any completions from old-generation workers are dropped at the identity check.
             CommitFrontier frontier = frontiers.computeIfAbsent(tp, k -> new CommitFrontier());
-            frontier.observe(records.get(0).offset());
+            for (ConsumerRecord<byte[], byte[]> r : records) {
+                frontier.observe(r.offset());
+            }
             inFlight.addAndGet(records.size());
             // dispatch is contractually throw-free: each dispatcher catches its own
             // launcher failures and fires onRecordDone for every record (success OR
@@ -430,9 +783,16 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         }
     }
 
-    private void shutdownDrain() {
+    /**
+     * Wait for in-flight workers to drain, bounded by the shared close deadline computed
+     * once in {@code run()}'s finally block (see the comment there). NOT computing its
+     * own fresh {@code shutdownDrainTimeoutMs}-long deadline here is the load-bearing
+     * part of the L4 fix: the caller passes the SAME deadline that also governs the
+     * final commit and {@code consumer.close()} below it, so this phase can't silently
+     * consume a budget larger than the one the runtime's join is waiting on.
+     */
+    private void shutdownDrain(long deadlineNanos) {
         long startNanos = System.nanoTime();
-        long deadlineNanos = startNanos + shutdownDrainTimeoutMs * 1_000_000L;
         while (inFlight.get() > 0 && System.nanoTime() < deadlineNanos) {
             try { Thread.sleep(50); }
             catch (InterruptedException ie) {
@@ -443,10 +803,12 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         int remaining = inFlight.get();
         long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
         if (remaining > 0) {
-            log.warn("shutdownDrainTimeout={}ms reached with {} record(s) still in flight; "
-                + "abandoning. Records that hadn't yet committed will be redelivered to the "
-                + "next owner of their partitions (at-least-once duplicate, per-partition "
-                + "ordering preserved).", shutdownDrainTimeoutMs, remaining);
+            log.warn("shutdown drain window ({}ms elapsed of shutdownDrainTimeout={}ms; the "
+                + "tail is reserved for the final commit + consumer close) reached with {} "
+                + "record(s) still in flight; abandoning. Records that hadn't yet committed "
+                + "will be redelivered to the next owner of their partitions (at-least-once "
+                + "duplicate, per-partition ordering preserved).",
+                elapsedMs, shutdownDrainTimeoutMs, remaining);
         } else if (elapsedMs > 0) {
             log.info("Shutdown drain completed in {}ms.", elapsedMs);
         }
@@ -492,7 +854,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
      * retry/reject/DLT. Listener failures are confined to this method — the retry
      * decision logic lives in {@link #handleProcessingFailure}.
      */
-    private Throwable invokeListener(
+    private @Nullable Throwable invokeListener(
         CommitFrontier frontier, TopicPartition tp,
         ConsumerRecord<byte[], byte[]> raw, InFlightRecord<byte[], byte[]> in) {
         long startNanos = System.nanoTime();
@@ -500,7 +862,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             ConsumerRecord<K, V> typed = deserialize(raw);
             listener.onRecord(typed, new ClassicConsumerContext(in, ordering));
             metrics.recordProcessDuration(raw.topic(), Duration.ofNanos(System.nanoTime() - startNanos));
-            metrics.recordsProcessed(raw.topic(), "accept");
+            metrics.recordsProcessed(raw.topic(), ProcessResult.ACCEPT);
             markComplete(frontier, tp, raw.offset());
             return null;
         } catch (Throwable t) {
@@ -529,7 +891,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             case RetryDecision.Reject reject -> {
                 log.warn("Rejecting non-retriable {}@{} on CLASSIC_BASIC: {}",
                     tp, raw.offset(), reject.cause().toString());
-                metrics.recordsProcessed(raw.topic(), "reject");
+                metrics.recordsProcessed(raw.topic(), ProcessResult.REJECT);
                 markComplete(frontier, tp, raw.offset());
                 yield false;
             }
@@ -564,41 +926,176 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         if (dltRouter == null) {
             log.error("Retry exhausted for {}@{} (no DLT configured); committing past (lossy): {}",
                 tp, raw.offset(), cause.toString());
-            metrics.recordsProcessed(raw.topic(), "reject");
+            metrics.recordsProcessed(raw.topic(), ProcessResult.REJECT);
             markComplete(frontier, tp, raw.offset());
             return;
         }
         log.warn("Retry exhausted for {}@{}, routing to DLT: {}", tp, raw.offset(), cause.toString());
+        if (publishToDlt(tp, in, cause)) {
+            completeDltSuccess(frontier, tp, raw);
+            return;
+        }
+        // First DLT publish failed. Rather than leave the poll loop fetching new records
+        // for this partition (parking their completions in completedAhead UNBOUNDEDLY while
+        // nothing commits during the outage), pause the partition and retry the publish on
+        // THIS worker with capped exponential backoff until it recovers, shutdown fires, or
+        // the partition is revoked.
+        pauseAndRetryDlt(frontier, tp, in, cause);
+    }
+
+    /**
+     * Attempt a single DLT publish, blocking up to the per-attempt budget. Returns
+     * {@code true} on success. On failure the appropriate {@code dltFailed} metric is
+     * emitted (via the {@link DltRouter.DltRoute} CAS guard for the caller-side give-up;
+     * {@link DltRouter} already emitted it for an async producer failure) and {@code false}
+     * is returned so the caller can decide whether to retry.
+     *
+     * <p>An {@link InterruptedException} while waiting re-sets the thread's interrupt flag
+     * and returns {@code false}; the retry loop's next interruptible sleep then observes it
+     * and stops — so a shutdown (worker-pool {@code shutdownNow}) unwinds promptly.
+     */
+    private boolean publishToDlt(TopicPartition tp, InFlightRecord<byte[], byte[]> in, Throwable cause) {
+        ConsumerRecord<byte[], byte[]> raw = in.consumerRecord();
         DltRouter.DltRoute route = dltRouter.route(in, cause);
         try {
-            route.future().get(30, TimeUnit.SECONDS);
-            metrics.recordsProcessed(raw.topic(), "accept");
-            markComplete(frontier, tp, raw.offset());
+            route.future().get(dltPublishBudgetMs, TimeUnit.MILLISECONDS);
+            return true;
         } catch (java.util.concurrent.TimeoutException | InterruptedException callerSide) {
             // Caller-side give-up. CAS metricEmitted so the eventual producer callback
             // (which may still fire later) does NOT also emit a metric — exactly one
-            // outcome per route call, no double-counting and no "dltFailed then
-            // dltRouted" sequence under a slow-but-eventually-successful DLT broker.
+            // outcome per route call, no double-counting and no "dltFailed then dltRouted"
+            // sequence under a slow-but-eventually-successful DLT broker.
             if (callerSide instanceof InterruptedException) Thread.currentThread().interrupt();
             if (route.metricEmitted().compareAndSet(false, true)) {
                 metrics.dltFailed(raw.topic(), callerSide.getClass().getSimpleName());
             }
-            log.error("DLT routing did not complete within budget for {}@{}; frontier "
-                + "WILL NOT advance — restart redelivers once DLT is healthy. Alert on "
+            log.error("DLT routing did not complete within budget for {}@{}. Alert on "
                 + "plurima.consumer.dlt.failures.", tp, raw.offset(), callerSide);
+            return false;
         } catch (Exception ex) {
             // ExecutionException wraps the producer's async failure — DltRouter already
-            // CAS-emitted dltFailed inside its callback. Same outcome: do NOT markComplete.
-            // The frontier stalls at this offset; later records on the same partition
-            // complete into completedAhead but never advance the commit past this gap.
-            // On the next restart (or rebalance), the broker redelivers from the last
-            // committed offset and we try DLT again. Worker accounting still happens via
-            // the dispatcher's onRecordDone in its own finally block, so inFlight stays
-            // balanced and backpressure recovers.
-            log.error("DLT routing failed for {}@{}; frontier WILL NOT advance — restart "
-                + "redelivers from this offset once DLT is healthy. Alert on "
-                + "plurima.consumer.dlt.failures.", tp, raw.offset(), ex);
+            // CAS-emitted dltFailed inside its callback.
+            log.error("DLT routing failed for {}@{}. Alert on plurima.consumer.dlt.failures.",
+                tp, raw.offset(), ex);
+            return false;
         }
+    }
+
+    /** Emit the accept metric and advance the frontier for a successful DLT publish. */
+    private void completeDltSuccess(CommitFrontier frontier, TopicPartition tp, ConsumerRecord<byte[], byte[]> raw) {
+        metrics.recordsProcessed(raw.topic(), ProcessResult.ACCEPT);
+        markComplete(frontier, tp, raw.offset());
+    }
+
+    /**
+     * Pause the partition (by publishing intent into {@link #pausedByDltFailure} — the poll
+     * thread applies the actual {@code consumer.pause} in {@link #applyDltFailurePause}) and
+     * retry the DLT publish on THIS worker thread with capped exponential backoff + jitter
+     * (1s start, 30s cap by default). The sleep runs on the worker, NEVER the poll thread,
+     * so the consumer keeps heartbeating throughout the outage.
+     *
+     * <h4>Concurrency invariants</h4>
+     * <ul>
+     *   <li><b>Ownership.</b> Re-checked before every sleep and every publish. A revoke (or
+     *       revoke+reassign) swaps the frontier instance in the map; the moment this worker
+     *       sees a different instance it stops — WITHOUT advancing the frontier — because the
+     *       new owner will redeliver from the last committed offset and re-attempt DLT
+     *       itself. Advancing here would falsely commit past a record the new owner still
+     *       owes.</li>
+     *   <li><b>Shutdown.</b> The loop condition is {@code running}, and every sleep is
+     *       interruptible. When {@code running} flips false (or the worker pool interrupts
+     *       this thread on {@code shutdownNow}) the loop exits and the frontier is left
+     *       unadvanced — the record redelivers after restart, which is correct at-least-once
+     *       behaviour.</li>
+     *   <li><b>Resume ordering.</b> On success the frontier is advanced FIRST, then this
+     *       worker's hold on {@code dltPauseHolds} is released (in the finally below);
+     *       the poll thread only resumes the partition after the LAST hold clears, by
+     *       which point the committable offset is already in place.</li>
+     *   <li><b>Concurrent retryers (refcount).</b> With UNORDERED/KEY ordering several
+     *       workers on the same partition can run this loop at once. Each acquires its
+     *       own hold on entry and releases it exactly once on exit (success, abort,
+     *       shutdown, interrupt — the finally guarantees it); the partition resumes only
+     *       when the LAST retryer finishes, never when the first one does. See
+     *       {@link #dltPauseHolds} for the full invariant, including why releases are
+     *       generation-guarded.</li>
+     * </ul>
+     */
+    private void pauseAndRetryDlt(
+        CommitFrontier frontier, TopicPartition tp, InFlightRecord<byte[], byte[]> in, Throwable cause) {
+        ConsumerRecord<byte[], byte[]> raw = in.consumerRecord();
+        // Signal the poll thread to pause this partition next iteration (refcounted —
+        // one hold per retrying worker). Independent of pausedByBackpressure so a
+        // backpressure resume can never lift this pause.
+        acquireDltPause(tp, frontier);
+        log.warn("DLT publish failed for {}@{}; pausing partition and retrying on this worker "
+            + "with capped exponential backoff. Frontier WILL NOT advance until the DLT "
+            + "recovers.", tp, raw.offset());
+        long backoffMs = dltRetryBaseMs;
+        try {
+            while (running) {
+                // Ownership re-check BEFORE sleeping so a revoke that already happened stops us
+                // immediately without burning a backoff interval.
+                if (frontiers.get(tp) != frontier) {
+                    logDltRetryAbort(tp, raw, "before backoff");
+                    return;
+                }
+                if (!sleepInterruptible(Duration.ofMillis(jitteredBackoff(backoffMs)))) {
+                    // running flipped false, or the thread was interrupted (pool shutdownNow).
+                    // Stop retrying; leave the frontier unadvanced — redeliver on restart.
+                    log.warn("DLT retry for {}@{} stopped by shutdown/interrupt; frontier NOT "
+                        + "advanced, record redelivers on restart.", tp, raw.offset());
+                    return;
+                }
+                // Ownership can change during the sleep too.
+                if (frontiers.get(tp) != frontier) {
+                    logDltRetryAbort(tp, raw, "after backoff");
+                    return;
+                }
+                if (publishToDlt(tp, in, cause)) {
+                    completeDltSuccess(frontier, tp, raw);
+                    log.info("DLT publish recovered for {}@{} after retry; partition will "
+                        + "resume once no other worker is still retrying.", tp, raw.offset());
+                    return;
+                }
+                backoffMs = Math.min(backoffMs * 2, dltRetryCapMs);
+            }
+            // running == false without a successful publish: shutdown between attempts.
+            log.warn("DLT retry loop for {}@{} stopped: consumer shutting down. Frontier NOT "
+                + "advanced; record redelivers on restart.", tp, raw.offset());
+        } finally {
+            // Release THIS worker's hold exactly once, on every exit path. Ordering: on
+            // the success path this runs AFTER completeDltSuccess, so the frontier holds
+            // a committable offset before the poll thread can resume the partition. The
+            // release is generation-guarded and decrement-at-zero: it lifts the pause
+            // only when no other worker of this generation still holds it, and it
+            // no-ops entirely if revoke already cleared the entry (or a newer
+            // generation re-acquired it).
+            releaseDltPause(tp, frontier);
+        }
+    }
+
+    /** Common abort logging for the DLT retry loop when the partition is no longer ours. */
+    private void logDltRetryAbort(TopicPartition tp, ConsumerRecord<byte[], byte[]> raw, String when) {
+        // No pause-hold cleanup here: the revoke path already cleared the partition's
+        // entry wholesale, and this worker's own (generation-guarded) release runs in
+        // pauseAndRetryDlt's finally regardless.
+        log.debug("Aborting DLT retry for {}@{} ({}): frontier identity changed "
+            + "(revoked/reassigned); new owner redelivers and re-attempts DLT.",
+            tp, raw.offset(), when);
+    }
+
+    /**
+     * Equal-jitter backoff: half the (capped) delay fixed, half random. Keeps a sensible
+     * floor while decorrelating retries across partitions and instances so a recovering
+     * DLT broker isn't hit by a synchronized thundering herd.
+     */
+    private long jitteredBackoff(long backoffMs) {
+        long capped = Math.min(backoffMs, dltRetryCapMs);
+        if (capped <= 1L) {
+            return capped;
+        }
+        long half = capped / 2L;
+        return half + ThreadLocalRandom.current().nextLong(half + 1L);
     }
 
     private boolean sleepInterruptible(Duration delay) {
@@ -721,19 +1218,35 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             // offset ≤ N. Remove only when the buffered offset is no newer.
             pendingFailedCommits.compute(tp, (k, buffered) ->
                 buffered == null || buffered.offset() <= committed ? null : buffered);
-            metrics.ackCommitted(tp.topic(), "accept");
+            metrics.ackCommitted(tp.topic(), AckOutcome.ACCEPT);
         }
     }
 
     /**
      * Synchronous variant of {@link #drainPendingCommits} used on the final shutdown
-     * drain. {@code commitAsync}'s callback may not fire before the consumer closes,
-     * which is exactly when a transient failure becomes "the last commit before
-     * shutdown" and turns into avoidable duplicates on restart. commitSync blocks
-     * until the broker confirms — bounded by the consumer's default timeout — so we
+     * drain, using the client's own default commit timeout. {@code commitAsync}'s
+     * callback may not fire before the consumer closes, which is exactly when a
+     * transient failure becomes "the last commit before shutdown" and turns into
+     * avoidable duplicates on restart. commitSync blocks until the broker confirms so we
      * know for certain whether the offsets landed.
+     *
+     * <p>Visible for testing — exercised directly by {@code ClassicPollLoopCommitRetryTest}
+     * without a shared shutdown deadline in play. Production shutdown goes through
+     * {@link #drainPendingCommitsSync(Duration)} instead, so the final commit shares the
+     * same deadline as the drain phase before it and {@code consumer.close()} after it.
      */
-    private void drainPendingCommitsSync() {
+    void drainPendingCommitsSync() {
+        drainPendingCommitsSync(null);
+    }
+
+    /**
+     * Deadline-bound variant used by {@code run()}'s shutdown finally block: {@code budget}
+     * is the time remaining on the shared close deadline (see that method's comment) after
+     * {@link #shutdownDrain}, so the final commit can't independently consume the client's
+     * unbounded default timeout on top of an already-exhausted drain phase. {@code null}
+     * preserves the no-arg overload's original unbounded-default behavior.
+     */
+    void drainPendingCommitsSync(Duration budget) {
         // Shutdown path: include in-flight async commits. This is the consumer's
         // last chance to confirm an offset whose async callback hasn't fired yet;
         // skipping it would mean restart redelivers records the consumer had
@@ -741,7 +1254,22 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         Map<TopicPartition, OffsetAndMetadata> snapshot = collectCommitSnapshot(/* includeInFlightAsync */ true);
         if (snapshot.isEmpty()) return;
         try {
-            consumer.commitSync(snapshot);
+            // shutdown() sets running=false THEN calls consumer.wakeup(). If the poll
+            // thread is between polls at that moment (already past its last poll(),
+            // now running the shutdown drain), the armed wakeup has nowhere to land
+            // until the next blocking consumer call — which is this commitSync. That
+            // throws WakeupException, and without special handling it would fall into
+            // the generic catch below and be treated as a genuine commit failure,
+            // silently dropping the last batch of offsets. wakeup() only arms a
+            // single interrupt (KafkaConsumer clears the flag when it's consumed), so
+            // retrying exactly once is guaranteed to get a real attempt through with
+            // no armed wakeup left to interrupt it.
+            try {
+                commitSyncBounded(snapshot, budget);
+            } catch (WakeupException wakeup) {
+                log.debug("armed shutdown wakeup consumed before final commit", wakeup);
+                commitSyncBounded(snapshot, budget);
+            }
             for (var e : snapshot.entrySet()) {
                 TopicPartition tp = e.getKey();
                 committedHighWater.merge(tp, e.getValue().offset(), Math::max);
@@ -750,18 +1278,34 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
                 // this partition is now resolved (the async callback may still fire
                 // later, but its outcome is irrelevant since the sync has authority).
                 inFlightAsyncCommits.remove(tp);
-                metrics.ackCommitted(tp.topic(), "accept");
+                metrics.ackCommitted(tp.topic(), AckOutcome.ACCEPT);
             }
         } catch (Exception ex) {
             // Final-shutdown commitSync failure: the partition's last committed offset
             // stays where the broker left it; restart redelivers from there with
-            // at-least-once duplicates. Log loudly so operators can alert.
+            // at-least-once duplicates. Log loudly so operators can alert. This also
+            // catches a (theoretically impossible) second WakeupException from the
+            // retry above, falling back to the same generic handling as any other
+            // commit failure.
             log.error("Final commitSync at shutdown FAILED for {}; partition will redeliver "
                 + "from the last successfully-committed offset on restart (at-least-once "
                 + "duplicate). Cause: {}", snapshot.keySet(), ex.toString());
             for (TopicPartition tp : snapshot.keySet()) {
                 metrics.ackCommitFailed(tp.topic(), ex.getClass().getSimpleName());
             }
+        }
+    }
+
+    /**
+     * Issues the final commitSync, using the client's default timeout when {@code budget}
+     * is {@code null} (the no-arg {@link #drainPendingCommitsSync()} test entry point) or
+     * the explicit shared-deadline remainder otherwise (production shutdown).
+     */
+    private void commitSyncBounded(Map<TopicPartition, OffsetAndMetadata> snapshot, Duration budget) {
+        if (budget != null) {
+            consumer.commitSync(snapshot, budget);
+        } else {
+            consumer.commitSync(snapshot);
         }
     }
 
@@ -844,6 +1388,17 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
             raw.deliveryCount());
     }
 
+    /**
+     * Called from a caller thread (not the poll thread) to request shutdown.
+     * Setting {@code running = false} first means the poll thread's own
+     * {@code while (running)} check can exit cleanly if it's between iterations;
+     * {@code wakeup()} then interrupts a {@code poll()} that's already blocked. But
+     * these two steps race with where the poll thread currently is: if it's already
+     * PAST its last poll and into the shutdown drain, the wakeup has nothing to
+     * interrupt there and arms itself for the next blocking consumer call instead
+     * — which is the final {@code commitSync} in {@link #drainPendingCommitsSync}.
+     * That method retries once specifically to absorb this race; see its comment.
+     */
     void shutdown() {
         running = false;
         consumer.wakeup();
@@ -873,12 +1428,59 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         return frontiers.containsKey(tp);
     }
 
+    /** Test/diagnostic — true if a DLT-publish failure is currently pausing the partition. */
+    boolean isPausedByDltFailure(TopicPartition tp) {
+        return pausedByDltFailure.contains(tp);
+    }
+
+    /**
+     * Test-only — shrink the DLT-retry backoff so tests exercise the failing-then-
+     * succeeding retry loop in milliseconds rather than seconds. Never called in
+     * production; the {@code volatile} fields default to 1s/30s per design.
+     */
+    void setDltRetryBackoffForTest(long baseMs, long capMs) {
+        this.dltRetryBaseMs = baseMs;
+        this.dltRetryCapMs = capMs;
+    }
+
+    /**
+     * Test-only — shrink {@link #dltPublishBudgetMs} so a DLT producer that never
+     * completes a send hits the caller-side timeout path in {@link #publishToDlt} in
+     * milliseconds rather than the production 30s. Never called in production.
+     */
+    void setDltPublishBudgetForTest(long budgetMs) {
+        this.dltPublishBudgetMs = budgetMs;
+    }
+
+    /**
+     * Test-only — drives {@link #acquireDltPause} directly. In production the acquire
+     * call sits immediately after {@code handleExhaustion}'s ownership check with no
+     * injectable delay, so the stale-generation-straggler race it guards against (a
+     * worker descheduled between that check and this call, waking after reassignment)
+     * is a single-instruction window that real concurrency can't be relied on to hit
+     * deterministically. This seam lets tests call it directly with an arbitrary
+     * (possibly non-live) frontier to exercise the generation guard itself.
+     */
+    void acquireDltPauseForTest(TopicPartition tp, CommitFrontier frontier) {
+        acquireDltPause(tp, frontier);
+    }
+
+    /** Test-only — drives {@link #releaseDltPause} directly; see {@link #acquireDltPauseForTest}. */
+    void releaseDltPauseForTest(TopicPartition tp, CommitFrontier frontier) {
+        releaseDltPause(tp, frontier);
+    }
+
     /** Test/diagnostic — returns the current frontier reference (or null). */
-    CommitFrontier frontier(TopicPartition tp) {
+    @Nullable CommitFrontier frontier(TopicPartition tp) {
         return frontiers.get(tp);
     }
 
-    /** Test/diagnostic — installs a frontier as if dispatchBatchAsync had run. */
+    /**
+     * Test/diagnostic — installs a frontier pinned at {@code firstOffset}. Unlike
+     * {@code dispatchBatchAsync}, this observes only the FIRST offset; tests that
+     * complete a dense range from there exercise the frontier's defensive dense
+     * fallback (see {@link CommitFrontier#observe}).
+     */
     CommitFrontier installFrontier(TopicPartition tp, long firstOffset) {
         CommitFrontier f = frontiers.computeIfAbsent(tp, k -> new CommitFrontier());
         f.observe(firstOffset);
@@ -892,6 +1494,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         for (TopicPartition tp : partitions) {
             frontiers.remove(tp);
         }
+        pausedByDltFailure.removeAll(partitions);
         if (keyShardDispatcher != null) {
             keyShardDispatcher.purgePartitions(partitions);
         }
@@ -906,6 +1509,7 @@ final class ClassicPollLoop<K, V> implements Runnable, AutoCloseable {
         return new ClassicRebalanceListener(
             consumer, frontiers, keyShardDispatcher,
             pausedByBackpressure,
+            pausedByDltFailure,
             () -> { if (pausedByBackpressure.isEmpty()) backpressureActive = false; },
             metrics,
             pendingFailedCommits,

@@ -31,7 +31,7 @@ class DeserializerIntegrationTest {
         AtomicReference<String> seenValue = new AtomicReference<>();
         CountDownLatch latch = new CountDownLatch(1);
 
-        try (PlurimaConsumer<String, String> consumer = PlurimaConsumer.<String, String>builder()
+        try (PlurimaConsumer<String, String> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(consumerProps(groupId))
                 .topic(topic)
                 .keyDeserializer(RecordDeserializer.utf8String())

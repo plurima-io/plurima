@@ -3,6 +3,7 @@ package io.plurima.kafka.internal;
 import io.plurima.kafka.ConsumerContext;
 import io.plurima.kafka.OrderingMode;
 import io.plurima.kafka.RecordListener;
+import io.plurima.kafka.ack.AckType;
 import io.plurima.kafka.deserializer.RecordDeserializer;
 import io.plurima.kafka.retry.RetryPolicy;
 import org.apache.kafka.clients.consumer.AcknowledgeType;
@@ -14,7 +15,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -44,8 +45,7 @@ class WorkerProcessorTest {
 
     private ConsumerContext ctxFor(InFlightRecord<byte[], byte[]> r) {
         return new ConsumerContext() {
-            @Override public short deliveryCount() { return 1; }
-            @Override public Optional<Short> deliveryCountOptional() { return Optional.of((short) 1); }
+            @Override public int deliveryCount() { return 1; }
             @Override public OrderingMode orderingMode() { return OrderingMode.UNORDERED; }
         };
     }
@@ -141,6 +141,57 @@ class WorkerProcessorTest {
         coordinator.commitPendingAcks(consumer);
         org.mockito.Mockito.verify(consumer).acknowledge(
             argThat(cr -> cr.topic().equals("t") && cr.partition() == 0 && cr.offset() == 4L),
+            eq(AcknowledgeType.RELEASE));
+    }
+
+    @Test
+    void forceReleaseDuringRetryBackoffStopsListenerReinvocation() throws Exception {
+        // Mirrors PollLoop.forceReleaseStuckRecords(): the drain barrier can abandon a record
+        // — queuing a slowness RELEASE via AckCoordinator.queueReleaseForSlowness, which marks
+        // terminalAckQueued (first-wins) — while the worker is asleep inside inline retry
+        // backoff (retryAfter's Thread.sleep). When that sleep wakes up, the retry loop must
+        // notice the terminal ack and stop, not call the listener again on an abandoned record.
+        AtomicInteger invocations = new AtomicInteger();
+        RecordListener<byte[], byte[]> listener = (r, ctx) -> {
+            invocations.incrementAndGet();
+            throw new IOException("transient");
+        };
+        ListenerInvoker invoker = ListenerInvoker.forImplicit(listener, RecordDeserializer.bytes(), RecordDeserializer.bytes());
+        WorkerProcessor p = new WorkerProcessor(
+            invoker,
+            new RetryEngine(RetryPolicy.exponential()
+                .maxAttempts(10)
+                .initialDelay(Duration.ofMillis(600)) // inline (< 1s INLINE_THRESHOLD), long
+                                                        // enough to land the force-RELEASE mid-sleep
+                .multiplier(1.0)
+                .jitter(0.0)
+                .retryOn(IOException.class)
+                .build()),
+            coordinator);
+
+        InFlightRecord<byte[], byte[]> r = rec(8);
+        Thread worker = new Thread(() -> p.process(r, ctxFor(r)));
+        worker.start();
+
+        // Wait for the first invocation to land (listener has thrown and the worker is now
+        // asleep in retryAfter's backoff), then race the drain barrier's force-RELEASE into
+        // that backoff window.
+        long start = System.nanoTime();
+        while (invocations.get() < 1 && (System.nanoTime() - start) < TimeUnit.SECONDS.toNanos(2)) {
+            Thread.onSpinWait();
+        }
+        assertThat(invocations.get()).isEqualTo(1);
+        coordinator.queueReleaseForSlowness(r); // force-RELEASE, as the drain barrier would
+
+        worker.join(5_000);
+        assertThat(worker.isAlive()).as("worker must exit once terminal ack is queued").isFalse();
+        assertThat(invocations.get())
+            .as("listener must not be re-invoked after force-RELEASE lands during retry backoff")
+            .isEqualTo(1);
+
+        coordinator.commitPendingAcks(consumer);
+        org.mockito.Mockito.verify(consumer).acknowledge(
+            argThat(cr -> cr.topic().equals("t") && cr.partition() == 0 && cr.offset() == 8L),
             eq(AcknowledgeType.RELEASE));
     }
 
@@ -244,7 +295,7 @@ class WorkerProcessorTest {
         AtomicInteger listenerInvocations = new AtomicInteger();
         io.plurima.kafka.ack.ManualAckListener<byte[], byte[]> manual = (rec, ack) -> {
             listenerInvocations.incrementAndGet();
-            ack.acknowledge(AcknowledgeType.ACCEPT);   // user accepts FIRST
+            ack.acknowledge(AckType.ACCEPT);   // user accepts FIRST
             throw new IOException("post-ack failure");  // then throws
         };
         ListenerInvoker invoker = ListenerInvoker.forManual(

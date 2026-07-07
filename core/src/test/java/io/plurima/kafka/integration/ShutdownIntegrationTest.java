@@ -29,7 +29,7 @@ class ShutdownIntegrationTest {
         AtomicInteger processed = new AtomicInteger();
         CountDownLatch firstProcessed = new CountDownLatch(1);
 
-        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(consumerProps(groupId))
             .topic(topic)
             .pollTimeout(Duration.ofMillis(100))

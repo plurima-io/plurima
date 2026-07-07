@@ -64,7 +64,7 @@ class ClassicBasicRetryDltIntegrationTest {
             .retryOn(IOException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -91,7 +91,7 @@ class ClassicBasicRetryDltIntegrationTest {
 
         // Verify commit landed: a second consumer in the same group sees nothing.
         CountDownLatch secondLatch = new CountDownLatch(1);
-        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -134,7 +134,7 @@ class ClassicBasicRetryDltIntegrationTest {
             .retryOn(IOException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -193,14 +193,14 @@ class ClassicBasicRetryDltIntegrationTest {
             .retryOn(IOException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
                 .ordering(OrderingMode.PARTITION)
                 .pollTimeout(Duration.ofMillis(200))
                 .retry(policy)
-                .deadLetterTopic(dlt)
+                .deadLetter(dlt)
                 .listener((r, ctx) -> {
                     // RetryEngine exhausts when COMPLETED retries reach maxAttempts.
                     // With maxAttempts=2, the listener runs 3 times total: the initial

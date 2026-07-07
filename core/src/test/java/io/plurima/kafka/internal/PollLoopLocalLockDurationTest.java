@@ -148,7 +148,7 @@ class PollLoopLocalLockDurationTest {
         PollLoop loop = new PollLoop(
             consumer, dispatcher, coordinator, registry, gate,
             Duration.ofMillis(50), localLock, Duration.ofSeconds(2),
-            localLock, PlurimaMetrics.noOp(), "t");
+            localLock, PlurimaMetrics.noOp(), "t", "g1");
 
         Thread t = new Thread(loop, "poll-loop-test");
         t.start();

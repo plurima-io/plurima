@@ -2,7 +2,13 @@
 
 > A production-grade abstraction over `KafkaShareConsumer` (KIP-932) and vanilla `KafkaConsumer`. Share-group fan-out, classic per-key ordering with intra-partition parallelism, exponential retry, dead-letter routing, and Spring Boot integration.
 
-**Status:** v0.2.0 — adds the `Message` handler API, handler timeouts, lock-duration auto-alignment, and slowness-aware retry budgeting.
+**Status:** v0.3.0 (unreleased) — this guide documents the hardened public API: a
+non-generic `builder()` with a `keyDeserializer`/`valueDeserializer` re-typing chain,
+`AckType` and `MessageHeaders` (replacing Kafka's `AcknowledgeType`/`Headers` on the
+public surface), `int deliveryCount()`, `deadLetter(...)` (renamed from
+`deadLetterTopic(...)`), consumer `state()`/`isRunning()`/`onFatalError(...)`,
+`plurima.enabled`, `${...}` placeholder support in `@PlurimaListener`, and
+Micrometer auto-registration. See [CHANGELOG](../CHANGELOG.md) for the full list.
 
 ---
 
@@ -21,8 +27,9 @@
 11. [Metrics](#metrics)
 12. [Spring Boot integration](#spring-boot-integration)
 13. [Shutdown semantics](#shutdown-semantics)
-14. [Known constraints & gotchas](#known-constraints--gotchas)
-15. [Troubleshooting](#troubleshooting)
+14. [Consumer state & fatal errors](#consumer-state--fatal-errors)
+15. [Known constraints & gotchas](#known-constraints--gotchas)
+16. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -110,7 +117,7 @@ Properties kafkaProps = new Properties();
 kafkaProps.put("bootstrap.servers", "localhost:9092");
 kafkaProps.put("group.id", "my-share-group");
 
-try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
         .kafkaProperties(kafkaProps)
         .topic("orders")
         .concurrency(50)
@@ -134,9 +141,11 @@ The consumer runs until you `close()` it (try-with-resources does this automatic
 ## Builder configuration
 
 ```java
-PlurimaConsumer.<K, V>builder()
+PlurimaConsumer.builder()
     .kafkaProperties(props)              // REQUIRED — bootstrap.servers, group.id, etc.
     .topic("orders")                      // REQUIRED — single topic per consumer
+    .keyDeserializer(RecordDeserializer.utf8String())   // re-types the builder to <K, V>; default: identity bytes
+    .valueDeserializer(RecordDeserializer.utf8String()) // must precede any handler setter below; default: identity bytes
     .listener((r, ctx) -> { ... })       // REQUIRED — OR .manualAckListener(...) / .onMessage(...) / .onMessageAck(...)
     .ordering(OrderingMode.UNORDERED)    // default UNORDERED; KEY/PARTITION require CLASSIC_BASIC
     .concurrency(50)                      // max concurrent in-flight records, default 50
@@ -145,13 +154,23 @@ PlurimaConsumer.<K, V>builder()
     .lockDuration(Duration.ofSeconds(30))// SHARE force-RELEASE deadline; if unset, auto-aligned to 0.8× broker lock
     .handlerTimeout(Duration.ofSeconds(30)) // SHARE only; interrupt a handler that runs longer (off by default)
     .shutdownDrainTimeout(Duration.ofSeconds(30))
-    .keyDeserializer(RecordDeserializer.utf8String())   // default: identity bytes
-    .valueDeserializer(RecordDeserializer.utf8String()) // default: identity bytes
     .retry(RetryPolicy.exponential().maxAttempts(5).build())
-    .deadLetterTopic(DltConfig.builder().producerProperties(producerProps).build())
+    .deadLetter(DltConfig.builder().producerProperties(producerProps).build())
     .metrics(new MicrometerPlurimaMetrics(meterRegistry))
+    .onFatalError(err -> log.error("consumer failed", err)) // default no-op; see § Consumer state & fatal errors
     .build();
 ```
+
+`.keyDeserializer(...)` and `.valueDeserializer(...)` each return a **re-typed**
+builder (`PlurimaConsumerBuilder<K2, V>` / `PlurimaConsumerBuilder<K, V2>`) rather
+than mutating in place — that's what lets `builder()` itself stay non-generic
+(fixed at `<byte[], byte[]>`) while still producing a fully-typed builder by the
+time you call `.build()`. Both **must be called before any handler setter**
+(`.listener(...)`, `.manualAckListener(...)`, `.onMessage(...)`,
+`.onMessageAck(...)`) — the handler setter fixes the builder's generic type at
+that point, so changing the deserializer afterward would leave it mismatched;
+doing so throws `IllegalStateException` with a message telling you to reorder
+the calls.
 
 ### Kafka property validation
 
@@ -193,28 +212,31 @@ CLASSIC_BASIC.
 
 The `ConsumerContext ctx` exposes:
 
-- `short deliveryCount()` — number of times this record has been delivered. On the **SHARE** engine this is the KIP-932 broker-tracked count (durable across rebalances). On **CLASSIC_BASIC** there is no broker-side counter; the value is Plurima's local in-process attempt counter (1 = first invocation; increments on each retry).
-- `Optional<Short> deliveryCountOptional()` — same value wrapped (mirrors the underlying Kafka API shape).
+- `int deliveryCount()` — number of times this record has been delivered (always ≥ 1, never zero — no `Optional` to unwrap). On the **SHARE** engine this is the KIP-932 broker-tracked count (natively a `short` on `ConsumerRecord`, widened to `int` here so callers never cast down to compare against a retry budget), durable across rebalances. On **CLASSIC_BASIC** there is no broker-side counter; the value is Plurima's local in-process attempt counter (1 = first invocation; increments on each retry).
 - `OrderingMode orderingMode()` — UNORDERED, KEY, or PARTITION.
 
 ### Manual ack (`ManualAckListener`)
 
 ```java
-import org.apache.kafka.clients.consumer.AcknowledgeType;
+import io.plurima.kafka.ack.AckType;
 
 .manualAckListener((record, ack) -> {
     if (validate(record)) {
-        ack.acknowledge(AcknowledgeType.ACCEPT);
+        ack.acknowledge(AckType.ACCEPT);
     } else {
-        ack.acknowledge(AcknowledgeType.REJECT);
+        ack.acknowledge(AckType.REJECT);
     }
 })
 ```
 
-`AckContext` extends `ConsumerContext` with `acknowledge(AcknowledgeType type)`.
-`AcknowledgeType` is Kafka's `org.apache.kafka.clients.consumer.AcknowledgeType`.
-The call is **idempotent** — the first `acknowledge` call wins; subsequent calls
-are silent no-ops.
+`AckContext` extends `ConsumerContext` with `acknowledge(AckType type)`.
+`AckType` (`io.plurima.kafka.ack.AckType`) is Plurima's own ack-type enum —
+`ACCEPT`, `RELEASE`, `REJECT` — and replaces Kafka's
+`org.apache.kafka.clients.consumer.AcknowledgeType` on the public API surface.
+Its fourth Kafka value, `RENEW`, is deliberately absent: Plurima does not expose
+a lock-renewal hook (see § Slow handlers and broker lock expiry). The call is
+**idempotent** — the first `acknowledge` call wins; subsequent calls are silent
+no-ops.
 
 If a manual-ack listener throws without acknowledging, the retry/DLT pipeline runs as usual.
 
@@ -234,6 +256,7 @@ code does not need Kafka client types.
 ```java
 import io.plurima.kafka.Message;
 import io.plurima.kafka.MessageListener;
+import io.plurima.kafka.deserializer.RecordDeserializer;
 
 class OrderHandler implements MessageListener<String, Order> {
     private final OrderService service;
@@ -249,11 +272,26 @@ class OrderHandler implements MessageListener<String, Order> {
     }
 }
 
-PlurimaConsumer.<String, Order>builder()
+PlurimaConsumer.builder()
     .kafkaProperties(props)
     .topic("orders")
+    .keyDeserializer(RecordDeserializer.utf8String())
+    .valueDeserializer((topic, bytes) -> objectMapper.readValue(bytes, Order.class))
     .onMessage(new OrderHandler(orderService))
     .build();
+```
+
+`msg.header(name)` returns the last value for a header name (`Optional<byte[]>`),
+matching Kafka's semantics for repeated header names. For multi-valued headers or
+to enumerate everything, use `msg.headers()`, which returns a Kafka-decoupled
+`MessageHeaders` view (`io.plurima.kafka.MessageHeaders`) rather than Kafka's own
+`org.apache.kafka.common.header.Headers`:
+
+```java
+MessageHeaders headers = msg.headers();
+List<byte[]> traceIds = headers.values("trace-id");
+Optional<byte[]> lastTraceId = headers.lastValue("trace-id");
+Set<String> allHeaderNames = headers.names();
 ```
 
 **Explicit ack** — `onMessageAck(MessageAckListener)` gives one object carrying
@@ -286,7 +324,7 @@ import io.plurima.kafka.Messages;
 new OrderHandler(orderService).onMessage(Messages.of("k1", order));
 
 Message<String, Order> retryMessage = Messages.builder("k1", order)
-    .deliveryCount((short) 3)
+    .deliveryCount(3)
     .header("trace-id", traceBytes)
     .build();
 ```
@@ -313,7 +351,7 @@ RecordDeserializer<MyEvent> json = (topic, bytes) -> objectMapper.readValue(byte
 Usage:
 
 ```java
-PlurimaConsumer.<String, MyEvent>builder()
+PlurimaConsumer.builder()
     .keyDeserializer(RecordDeserializer.utf8String())
     .valueDeserializer(json)
     .listener((record, ctx) -> {
@@ -467,7 +505,7 @@ RetryPolicy policy = RetryPolicy.exponential()
     .retryOn(IOException.class, TimeoutException.class)
     .build();
 
-PlurimaConsumer.<...>builder()
+PlurimaConsumer.builder()
     .retry(policy)
     ...
 ```
@@ -507,11 +545,16 @@ DltConfig dlt = DltConfig.builder()
     .includeStackTrace(true)            // adds plurima-dlt-stack-trace header (4 KB max)
     .build();
 
-PlurimaConsumer.<...>builder()
+PlurimaConsumer.builder()
     .retry(retryPolicy)
-    .deadLetterTopic(dlt)
+    .deadLetter(dlt)
     ...
 ```
+
+> **Deserialization failures are never DLT-routed.** Poison-pill records (broker
+> `RecordDeserializationException`) are always `REJECT`ed with the
+> `plurima.consumer.records.poison_pill` metric — see § Deserializers. DLT routing
+> only applies to exceptions thrown by your handler after successful deserialization.
 
 ### What gets sent to the DLT
 
@@ -657,7 +700,7 @@ latency:
 Only affects the straggler path (no change when handlers finish promptly). A
 RELEASE'd straggler is redelivered — so this trades a shorter stall for duplicate
 reprocessing of slow records (at-least-once already permits duplicates). SHARE only;
-rejected at build time on `CLASSIC_BASIC`. Watch `plurima.consumer.barrier.timeout_ms`
+rejected at build time on `CLASSIC_BASIC`. Watch `plurima.consumer.barrier.timeout`
 to see the effective barrier and tune `multiplier`.
 
 ---
@@ -665,6 +708,22 @@ to see the effective barrier and tune `multiplier`.
 ## Metrics
 
 Plurima emits 15 metrics (11 counters, 2 gauges, 2 timers) via a stable `PlurimaMetrics` interface. Defaults to no-op; opt in by wiring an implementation.
+
+As of 0.3.0, the previously stringly-typed tag parameters are small enums instead:
+`ProcessResult` (`recordsProcessed`), `AckOutcome` (`ackQueued`/`ackCommitted`), and
+`BackpressureEvent` (`backpressureEvent`) — all in `io.plurima.kafka.metrics`. Each
+enum's `toString()` renders the same lower-case tag value the Micrometer adapter
+already emitted (e.g. `accept`), **except** on the SHARE engine's ack metrics,
+which previously emitted upper-case values (`ACCEPT`, from
+`AcknowledgeType.name()`) due to a casing inconsistency — those now match
+CLASSIC_BASIC's lower-case convention. If you have dashboards/alerts keyed on the
+old upper-case SHARE values, update them.
+
+The SPI also gained `close()` (default no-op), called exactly once from
+`PlurimaConsumer.close()` (including the fatal-failure self-close path). Custom
+implementations that register external resources per-consumer (e.g. gauges) should
+override it to release them; `MicrometerPlurimaMetrics` already does, deregistering
+every gauge it registered.
 
 ### Micrometer (recommended)
 
@@ -674,10 +733,16 @@ import io.plurima.kafka.metrics.MicrometerPlurimaMetrics;
 
 MeterRegistry registry = ...;  // from your application
 
-PlurimaConsumer.<...>builder()
+PlurimaConsumer.builder()
     .metrics(new MicrometerPlurimaMetrics(registry))
     ...
 ```
+
+Pass `true` as a second constructor argument —
+`new MicrometerPlurimaMetrics(registry, true)` — to publish percentile histograms
+on the two timers (`process.duration`, `poll.duration`) for backends that compute
+quantiles server-side (e.g. Prometheus). Defaults to `false` to keep memory
+overhead opt-in.
 
 ### Emitted metrics
 
@@ -686,35 +751,40 @@ Plurima emits 15 metrics: 11 counters, 2 gauges, and 2 timers.
 | Name | Type | Tags | Fired when |
 |---|---|---|---|
 | `plurima.consumer.records.polled` | Counter | `topic` | Each batch returned from poll() |
-| `plurima.consumer.records.processed` | Counter | `topic`, `result` | Listener completes (`accept`/`release`/`reject`) |
+| `plurima.consumer.records.processed` | Counter | `topic`, `result` | Listener completes (`ProcessResult`: `accept`/`release`/`reject`) |
 | `plurima.consumer.records.failed` | Counter | `topic`, `exception_class` | Listener throws |
-| `plurima.consumer.records.poison_pill` | Counter | `topic`, `cause` | RecordDeserialization or CorruptRecord |
+| `plurima.consumer.records.poison_pill` | Counter | `topic`, `cause` | RecordDeserialization or CorruptRecord (never DLT-routed — see § Deserializers) |
 | `plurima.consumer.records.in_flight` | Gauge | `topic`, `group_id`, `client_id` | Current count of records being processed. Emitted by both SHARE and CLASSIC_BASIC. |
-| `plurima.consumer.barrier.timeout_ms` | Gauge | `topic`, `group_id`, `client_id` | Current adaptive/share drain barrier timeout in milliseconds. |
+| `plurima.consumer.barrier.timeout` | Gauge | `topic`, `group_id`, `client_id` | Current adaptive/share drain barrier timeout, in milliseconds (`baseUnit=milliseconds`). Renamed from `plurima.consumer.barrier.timeout_ms` in 0.3.0 — the unit is now carried as Micrometer `baseUnit` metadata instead of a name suffix. |
 | `plurima.consumer.retry.attempts` | Counter | `topic`, `attempt` | Each retry attempt |
 | `plurima.consumer.dlt.routed` | Counter | `topic`, `dlt_topic` | DLT send success |
 | `plurima.consumer.dlt.failures` | Counter | `topic`, `cause` | DLT send failure |
-| `plurima.consumer.ack.queued` | Counter | `type` | Ack of given type queued (ACCEPT/RELEASE/REJECT) |
-| `plurima.consumer.ack.committed` | Counter | `topic`, `type` | Ack applied to consumer's in-memory ack set |
+| `plurima.consumer.ack.queued` | Counter | `type` | Ack of given type queued (`AckOutcome`: `accept`/`release`/`reject`) |
+| `plurima.consumer.ack.committed` | Counter | `topic`, `type` | Ack applied to consumer's in-memory ack set (`AckOutcome`: `accept`/`release`/`reject`) |
 | `plurima.consumer.ack.commit_failed` | Counter | `topic`, `exception_class` | `commitAsync` fails per-partition |
-| `plurima.consumer.backpressure.events` | Counter | `topic`, `event` | CLASSIC_BASIC pause/resume events (`event=paused` / `event=resumed`). Not emitted by SHARE. |
+| `plurima.consumer.backpressure.events` | Counter | `topic`, `event` | CLASSIC_BASIC pause/resume events (`BackpressureEvent`: `event=paused` / `event=resumed`). Not emitted by SHARE. |
 | `plurima.consumer.process.duration` | Timer | `topic` | Listener invocation latency |
-| `plurima.consumer.poll.duration` | Timer | — | Duration of a single poll() call |
+| `plurima.consumer.poll.duration` | Timer | `topic`, `group_id` | Duration of a single poll() call |
 
-Metric names are **stable for the 0.2.x line**. Additional metrics may be added in
-future minor releases without removing or renaming the existing public metrics.
+Metric names are **stable for the 0.2.x line**, with the one intentional rename
+noted above (`barrier.timeout_ms` → `barrier.timeout`) shipping in 0.3.0. Additional
+metrics may be added in future minor releases without removing or renaming existing
+public metrics.
 
 ### Custom implementation
 
 Implement `PlurimaMetrics` directly to integrate with other systems:
 
 ```java
+import io.plurima.kafka.metrics.ProcessResult;
+
 PlurimaMetrics myMetrics = new PlurimaMetrics() {
     @Override
-    public void recordsProcessed(String topic, String result) {
+    public void recordsProcessed(String topic, ProcessResult result) {
         myStatsdClient.increment("plurima." + topic + "." + result);
     }
-    // ... other methods default to no-op
+    // ... other methods default to no-op; override close() to release any
+    // resources you registered per-consumer.
 };
 ```
 
@@ -734,12 +804,22 @@ implementation("io.plurima:kafka-plurima-spring-boot-starter:0.2.0")
 
 ```yaml
 plurima:
+  enabled: true          # master switch; false suppresses all Plurima autoconfiguration
   bootstrap-servers: localhost:9092
   client-id: my-app
   properties:
     # Anything else you want passed to KafkaShareConsumer
     # Note: forbidden keys (auto.offset.reset, etc) still rejected
 ```
+
+`plurima.enabled` defaults to `true`. Set it to `false` to suppress the starter's
+autoconfiguration entirely — e.g. in a test slice that shouldn't register any
+Kafka consumer beans.
+
+When `plurima.client-id` is set, each `@PlurimaListener` endpoint gets its own
+suffixed `client.id` — `<client-id>-<beanName>-<methodName>` (spring-kafka
+style) — so multiple listeners in one application don't collide on the same
+Kafka client MBean name or collapse onto one `client_id` metric tag.
 
 ### Annotate a method
 
@@ -758,7 +838,7 @@ public class OrderHandler {
         groupId = "order-processor",
         engine = ConsumerEngine.CLASSIC_BASIC,  // required for ordering = KEY
         ordering = OrderingMode.KEY,
-        concurrency = 25
+        concurrency = "25"
     )
     public void onOrder(ConsumerRecord<byte[], byte[]> record) {
         // Plurima starts a consumer per annotated method when the context refreshes,
@@ -767,13 +847,19 @@ public class OrderHandler {
 }
 ```
 
+`concurrency` is a `String`, not an `int`, so it supports Spring `${...}` property
+placeholders — e.g. `concurrency = "${orders.concurrency:50}"`. The post-processor
+resolves the placeholder and parses the result as a positive integer at startup; a
+non-numeric or non-positive value fails fast with a descriptive error. `topics`
+and `groupId` support the same `${...}` placeholder syntax.
+
 ### Wiring retry, DLT, and metrics
 
 Three optional integrations are resolved from the Spring context:
 
 - **Retry**: declare a `RetryPolicy` bean and reference it by name from the annotation.
 - **DLT**: declare a `DltConfig` bean and reference it by name from the annotation.
-- **Metrics**: declare any `PlurimaMetrics` bean (e.g. `MicrometerPlurimaMetrics`); the starter discovers it automatically and wires it into every listener — no annotation field needed.
+- **Metrics**: declare any `PlurimaMetrics` bean (e.g. `MicrometerPlurimaMetrics`); the starter discovers it automatically and wires it into every listener — no annotation field needed. If you don't declare one yourself, and `kafka-plurima-metrics` (which brings Micrometer) is on the runtime classpath alongside an existing `MeterRegistry` bean, the starter **auto-registers** a `MicrometerPlurimaMetrics` bean for you — add the dependency and it just works, no `@Bean` needed. The starter only `compileOnly`-depends on `:metrics`, so this activates silently once you add the artifact yourself; it never forces Micrometer onto starter-only users.
 
 ```java
 @Configuration
@@ -823,7 +909,7 @@ For programmatic registration:
 ```java
 @Bean
 PlurimaConsumer<String, MyEvent> orderConsumer(MeterRegistry meterRegistry) {
-    return PlurimaConsumer.<String, MyEvent>builder()
+    return PlurimaConsumer.builder()
         .kafkaProperties(props)
         .topic("orders")
         .keyDeserializer(RecordDeserializer.utf8String())
@@ -860,6 +946,47 @@ Default `shutdownDrainTimeout` is 30 seconds. Tune to match your handler max-run
 
 For Kubernetes deployments, set the pod's `terminationGracePeriodSeconds` to `shutdownDrainTimeout + 10–15s` (the extra covers worker-executor grace + KafkaConsumer close + DLT producer close) so the kubelet doesn't SIGKILL before drain finishes.
 
+On `CLASSIC_BASIC`, the drain → final-commit → `consumer.close()` sequence shares
+a single deadline computed once at the start of `close()`, rather than each phase
+getting its own fresh `shutdownDrainTimeout`-sized budget — this bounds total
+shutdown time to roughly `shutdownDrainTimeout` end-to-end instead of a multiple
+of it.
+
+---
+
+## Consumer state & fatal errors
+
+`PlurimaConsumer` exposes its lifecycle so callers don't have to infer it from
+side effects:
+
+```java
+PlurimaConsumer.State state = consumer.state();  // NEW, RUNNING, CLOSED, or FAILED
+boolean running = consumer.isRunning();          // shorthand for state() == RUNNING
+```
+
+- `NEW` — built but `start()` not yet called.
+- `RUNNING` — the poll thread is active.
+- `CLOSED` — shut down normally via `close()` (or try-with-resources exit).
+- `FAILED` — the poll thread hit an unrecoverable error and closed itself. Terminal, like `CLOSED`.
+
+If the poll thread encounters an error it cannot recover from, the consumer
+transitions to `FAILED`, runs the same close sequence described above (drain,
+force-RELEASE/abandon in-flight work, close the Kafka client), and then invokes
+the builder's `.onFatalError(Consumer<Throwable>)` callback — default no-op —
+**exactly once**, on the poll thread, with the causing exception:
+
+```java
+.onFatalError(err -> {
+    log.error("Plurima consumer failed fatally", err);
+    // alert, trigger a restart, flip a readiness probe, etc.
+})
+```
+
+Plurima does not restart itself after a fatal failure — a `FAILED` consumer stays
+`FAILED`; build and start a new one if you want to retry. `PlurimaMetrics.close()`
+is called exactly once as part of this self-close path too, so gauges registered
+for a fatally-failed consumer are still deregistered.
+
 ---
 
 ## Known constraints & gotchas
@@ -894,8 +1021,8 @@ Without explicit deserializers, the consumer is `PlurimaConsumer<byte[], byte[]>
 
 ### Deferred metrics
 
-The v0.2.0 metrics surface is the 15 metrics listed above: 11 counters, 2 gauges
-(`plurima.consumer.records.in_flight`, `plurima.consumer.barrier.timeout_ms`), and
+The metrics surface is the 15 metrics listed above: 11 counters, 2 gauges
+(`plurima.consumer.records.in_flight`, `plurima.consumer.barrier.timeout`), and
 2 timers (`plurima.consumer.process.duration`, `plurima.consumer.poll.duration`). Histograms
 (`records.delivery_count`, etc.), the broker-lag gauge (`plurima.consumer.lag`,
 KIP-1226 bridge), and shard-internal gauges (`shard.queue.depth`, `shard.busy`) remain
@@ -945,7 +1072,7 @@ After the timeout, Plurima force-RELEASEs in-flight records (broker re-delivers 
 
 1. The DLT topic doesn't exist. Plurima doesn't auto-create it; pre-create with the right partition count.
 2. The DLT producer's `bootstrap.servers` is wrong. Verify in your `DltConfig.producerProperties()`.
-3. The original exception was NOT classified as retriable (default `RetryPolicy.noRetry()`). DLT only fires on `RetryDecision.Exhausted`, which requires at least one retry to be exhausted. With `RetryPolicy.noRetry()`, any exception becomes `Reject` → just REJECT, no DLT routing.
+3. The original exception was NOT classified as retriable (default `RetryPolicy.noRetry()`). DLT only fires once the retry pipeline **exhausts** every configured attempt (an internal decision — `RetryDecision` is not a public type), which requires at least one retry attempt in the first place. With `RetryPolicy.noRetry()`, any exception is immediately rejected → just REJECT, no DLT routing.
 
 To route every failure to DLT:
 
@@ -975,9 +1102,8 @@ Apache 2.0 — see [`LICENSE`](../LICENSE).
 
 ## Trademark Notice
 
-KAFKA is a registered trademark of The Apache Software Foundation and has been
-licensed for use by Plurima. Plurima has no affiliation with and is not endorsed
-by The Apache Software Foundation.
+Apache Kafka and Kafka are registered trademarks of The Apache Software Foundation.
+Plurima is not affiliated with, endorsed, or sponsored by the ASF.
 
 See the [Apache Kafka trademark guidance](https://kafka.apache.org/community/trademark/).
 See [`TRADEMARKS.md`](../TRADEMARKS.md) for the repository trademark notice.

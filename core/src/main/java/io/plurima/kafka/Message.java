@@ -1,7 +1,7 @@
 package io.plurima.kafka;
 
 import io.plurima.kafka.annotation.Stable;
-import org.apache.kafka.common.header.Headers;
+import org.jspecify.annotations.Nullable;
 
 import java.time.Instant;
 import java.util.Optional;
@@ -27,10 +27,10 @@ import java.util.Optional;
 public interface Message<K, V> extends ConsumerContext {
 
     /** The deserialized key, or {@code null} (e.g. a tombstone). */
-    K key();
+    @Nullable K key();
 
     /** The deserialized value, or {@code null} (e.g. a tombstone). */
-    V value();
+    @Nullable V value();
 
     /** Source topic. */
     String topic();
@@ -50,6 +50,6 @@ public interface Message<K, V> extends ConsumerContext {
      */
     Optional<byte[]> header(String name);
 
-    /** All record headers (the Kafka {@link Headers} type, for advanced use). */
-    Headers headers();
+    /** All record headers, as a Kafka-decoupled {@link MessageHeaders} view. */
+    MessageHeaders headers();
 }

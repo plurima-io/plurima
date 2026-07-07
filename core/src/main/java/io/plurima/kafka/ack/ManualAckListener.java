@@ -8,6 +8,9 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
  * explicitly. If a manual-ack listener throws, the standard retry/DLT pipeline runs
  * as usual; only the success path differs (no auto-ACCEPT).
  *
+ * <p>returning without acknowledging auto-RELEASEs; the first acknowledgement wins and
+ * subsequent calls are no-ops.
+ *
  * @param <K> deserialized key type
  * @param <V> deserialized value type
  */
@@ -16,7 +19,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 public interface ManualAckListener<K, V> {
     /**
      * Process a single record. The listener MUST call {@code ctx.acknowledge(...)}
-     * exactly once with the desired terminal {@link org.apache.kafka.clients.consumer.AcknowledgeType}.
+     * exactly once with the desired terminal {@link AckType}.
      *
      * @param record the polled record
      * @param ctx ack handle for this record

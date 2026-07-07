@@ -51,7 +51,7 @@ class DltIntegrationTest {
         Properties dltProducerProps = new Properties();
         dltProducerProps.put("bootstrap.servers", BOOTSTRAP);
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(consumerProps(groupId))
                 .topic(topic)
                 .pollTimeout(Duration.ofMillis(200))
@@ -62,7 +62,7 @@ class DltIntegrationTest {
                     .jitter(0.0)
                     .retryOn(IOException.class)
                     .build())
-                .deadLetterTopic(DltConfig.builder()
+                .deadLetter(DltConfig.builder()
                     .producerProperties(dltProducerProps)
                     .build())
                 .listener((r, ctx) -> {

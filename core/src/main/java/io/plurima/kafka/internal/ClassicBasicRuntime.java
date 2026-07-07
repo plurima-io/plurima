@@ -1,6 +1,7 @@
 package io.plurima.kafka.internal;
 
 import io.plurima.kafka.OrderingMode;
+import io.plurima.kafka.PlurimaConsumer;
 import io.plurima.kafka.RecordListener;
 import io.plurima.kafka.annotation.Internal;
 import io.plurima.kafka.deserializer.RecordDeserializer;
@@ -17,6 +18,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /**
  * Runtime for the CLASSIC_BASIC engine — vanilla {@code KafkaConsumer} wrapped by
@@ -49,7 +51,12 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
     private final Duration pollTimeout;
     private final Duration shutdownDrainTimeout;
     private final PlurimaMetrics metrics;
+    private final Consumer<Throwable> onFatalError; // never null; PlurimaConsumerBuilder defaults to a no-op
 
+    // Written by start() (-> RUNNING, unconditionally, before the poll thread starts) and
+    // by close()/handleFatal() (-> CLOSED / FAILED respectively); the latter two only ever
+    // write after winning the `closed` CAS below, so exactly one terminal write ever lands.
+    private volatile PlurimaConsumer.State state = PlurimaConsumer.State.NEW;
     private volatile KafkaConsumer<byte[], byte[]> consumer;
     private volatile ClassicPollLoop<K, V> pollLoop;
     private volatile Thread pollThread;
@@ -75,7 +82,8 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
         DltConfig dltConfig,
         Duration pollTimeout,
         Duration shutdownDrainTimeout,
-        PlurimaMetrics metrics) {
+        PlurimaMetrics metrics,
+        Consumer<Throwable> onFatalError) {
         this.kafkaProperties = kafkaProperties;
         this.topic = topic;
         this.listener = listener;
@@ -89,6 +97,7 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
         this.pollTimeout = pollTimeout;
         this.shutdownDrainTimeout = shutdownDrainTimeout;
         this.metrics = metrics;
+        this.onFatalError = onFatalError;
     }
 
     @Override
@@ -121,6 +130,11 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
             log.info("Auto-generated client.id={} for CLASSIC_BASIC engine", clientId);
         }
 
+        // Read once, before the poll loop is constructed, so both the loop's
+        // plurima.consumer.poll.duration tag and the in_flight gauge below use the
+        // same value.
+        String groupId = props.getProperty("group.id", "unknown");
+
         KafkaConsumer<byte[], byte[]> kc = null;
         WorkerLauncher launcher = null;
         ClassicPollLoop<K, V> loop = null;
@@ -133,7 +147,7 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
 
             localDltRouter = dltConfig != null ? new DltRouter(dltConfig, metrics) : null;
             loop = new ClassicPollLoop<>(
-                kc, topic, listener, keyDeserializer, valueDeserializer,
+                kc, topic, groupId, listener, keyDeserializer, valueDeserializer,
                 ordering, new RetryEngine(retryPolicy), localDltRouter,
                 pollTimeout,
                 shutdownDrainTimeout.toMillis(),
@@ -144,12 +158,16 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
                 // doesn't leak the KafkaConsumer / DltRouter / WorkerLauncher. The close()
                 // method is idempotent via the AtomicBoolean above, so calling it again
                 // from the user's close() path is a safe no-op.
-                this::close);
+                this::close,
+                // Fatal-error hook (B6): fires INSTEAD OF the plain close() above when the
+                // loop exits via its generic catch(Throwable) branch. handleFatal transitions
+                // state to FAILED, self-closes (same cleanup as close()), then invokes the
+                // user's onFatalError callback — see handleFatal for the exact ordering.
+                this::handleFatal);
 
             // Register plurima.consumer.records.in_flight gauge backed by the poll loop's
             // own counter. SHARE registers the same metric off its InFlightRegistry; both
             // engines now emit it consistently with the UserGuide § Metrics table.
-            String groupId = props.getProperty("group.id", "unknown");
             ClassicPollLoop<K, V> finalLoop = loop;
             metrics.registerInFlightGauge(topic, groupId, clientId, finalLoop::inFlightCount);
 
@@ -177,6 +195,7 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
             this.pollThread = t;
             this.workerLauncher = launcher;
             this.dltRouter = localDltRouter;
+            this.state = PlurimaConsumer.State.RUNNING;
 
             t.start();
 
@@ -196,6 +215,20 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
             if (localDltRouter != null) RuntimeCleanup.quietly(localDltRouter::close);
             if (kc != null) RuntimeCleanup.quietly(kc::close);
             if (launcher != null) RuntimeCleanup.quietly(launcher::close);
+            // The in_flight gauge may already be registered by the time subscribe/thread
+            // start threw; without invoking the metrics close hook here the gauge stays
+            // bound to this dead runtime forever — a retry with a fixed client.id can
+            // then never re-register its own. Guarded by the SAME `closed` CAS as
+            // close()/handleFatal so the metrics close still fires exactly once overall:
+            // a subsequent (redundant) user close() on this failed runtime loses the CAS
+            // and no-ops. State lands on FAILED — start() threw, so CLOSED would
+            // misreport a clean shutdown that never happened, and NEW would pretend
+            // start() was never attempted; the CAS also guarantees close() can no longer
+            // overwrite this with CLOSED.
+            if (closed.compareAndSet(false, true)) {
+                state = PlurimaConsumer.State.FAILED;
+                RuntimeCleanup.logIfRaised("PlurimaMetrics", metrics::close);
+            }
             throw e;
         }
     }
@@ -203,10 +236,46 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
     @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) return;
+        state = PlurimaConsumer.State.CLOSED;
+        doClose();
+    }
+
+    /**
+     * Fatal-error hook wired into {@link ClassicPollLoop}'s {@code onFatal} parameter (B6).
+     * Called from the poll thread ONLY when {@code ClassicPollLoop.run()} exits via its
+     * generic {@code catch (Throwable t)} branch — an unrecoverable error, never a normal
+     * shutdown.
+     *
+     * <p>Shares the {@link #closed} CAS guard with {@link #close()} so exactly one of the
+     * two "wins" the actual cleanup: if a user-initiated {@code close()} already ran (or
+     * wins a concurrent race), this method's CAS fails and it is a no-op — per the
+     * PlurimaConsumer.State contract, a fatal error observed after an already-completed
+     * clean close leaves the state at {@code CLOSED}, and the callback is NOT invoked
+     * (there is nothing new to report; the consumer was already deliberately stopped).
+     * Otherwise: transition to {@code FAILED} BEFORE the self-close runs (so {@code doClose}
+     * can't race a state observer into seeing a stale RUNNING), run the same cleanup
+     * {@link #close()} would, then invoke the user's {@code onFatalError} callback — caught
+     * and logged, never propagated, so a misbehaving callback can't wedge the poll thread's
+     * shutdown.
+     */
+    private void handleFatal(Throwable t) {
+        if (closed.compareAndSet(false, true)) {
+            state = PlurimaConsumer.State.FAILED;
+            doClose();
+            RuntimeCleanup.logIfRaised("onFatalError callback", () -> onFatalError.accept(t));
+        }
+    }
+
+    /**
+     * Shared cleanup body for {@link #close()} and {@link #handleFatal}. Only the caller
+     * decides the resulting {@link #state} (CLOSED vs FAILED) and only after winning the
+     * {@link #closed} CAS — this method itself does not touch {@link #state}.
+     */
+    private void doClose() {
         if (pollLoop != null) pollLoop.shutdown();
-        // The onLoopExit callback invokes close() FROM the poll thread on a fatal-error
-        // loop exit. Joining the poll thread on itself would block forever — skip the
-        // self-join; the thread is already exiting its run() method below us.
+        // onFatal/onLoopExit invoke handleFatal()/close() FROM the poll thread on a
+        // fatal-error loop exit. Joining the poll thread on itself would block forever —
+        // skip the self-join; the thread is already exiting its run() method below us.
         if (pollThread != null && Thread.currentThread() != pollThread) {
             RuntimeCleanup.joinQuietly(pollThread, shutdownDrainTimeout.toMillis() + 5_000);
         }
@@ -218,6 +287,15 @@ public final class ClassicBasicRuntime<K, V> implements ConsumerRuntime {
         // the consumer itself. Non-daemon thread; JVM still waits.
         if (dltRouter != null) RuntimeCleanup.logIfRaised("DltRouter", dltRouter::close);
         if (workerLauncher != null) workerLauncher.close();
+        // Called exactly once here: doClose() only ever runs after winning the `closed`
+        // CAS in close() or handleFatal(), and both share this method — see PlurimaMetrics
+        // .close() javadoc for the "exactly once, including the fatal path" contract.
+        RuntimeCleanup.logIfRaised("PlurimaMetrics", metrics::close);
+    }
+
+    @Override
+    public PlurimaConsumer.State state() {
+        return state;
     }
 
     /** Visible for tests: whether {@link #close()} has run. */

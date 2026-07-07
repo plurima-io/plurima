@@ -2,7 +2,6 @@ package io.plurima.kafka.ack;
 
 import io.plurima.kafka.Message;
 import io.plurima.kafka.annotation.Stable;
-import org.apache.kafka.clients.consumer.AcknowledgeType;
 
 /**
  * A {@link Message} that also carries explicit acknowledgement, for
@@ -17,18 +16,17 @@ public interface AckMessage<K, V> extends Message<K, V> {
 
     /**
      * Acknowledge this record with a terminal type. First call wins; later calls are no-ops.
-     * {@code RENEW} is ignored with a WARN (matches {@link AckContext#acknowledge}).
      *
      * @param type {@code ACCEPT}, {@code REJECT}, or {@code RELEASE}
      */
-    void acknowledge(AcknowledgeType type);
+    void acknowledge(AckType type);
 
     /** Shorthand for {@code acknowledge(ACCEPT)} — processed successfully. */
-    default void accept() { acknowledge(AcknowledgeType.ACCEPT); }
+    default void accept() { acknowledge(AckType.ACCEPT); }
 
     /** Shorthand for {@code acknowledge(RELEASE)} — hand back to the broker for redelivery. */
-    default void release() { acknowledge(AcknowledgeType.RELEASE); }
+    default void release() { acknowledge(AckType.RELEASE); }
 
     /** Shorthand for {@code acknowledge(REJECT)} — give up on this record. */
-    default void reject() { acknowledge(AcknowledgeType.REJECT); }
+    default void reject() { acknowledge(AckType.REJECT); }
 }

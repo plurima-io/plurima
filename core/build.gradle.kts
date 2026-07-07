@@ -4,7 +4,11 @@ plugins {
 
 dependencies {
     api(libs.kafka.clients)
-    api(libs.slf4j.api)
+    // implementation, not api: slf4j types (Logger/LoggerFactory) are used only internally
+    // (PlurimaConsumer's private static logger field) — no public signature in :core exposes
+    // org.slf4j.* — so downstream consumers don't need it on their compile classpath.
+    implementation(libs.slf4j.api)
+    api(libs.jspecify)
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
@@ -12,9 +16,6 @@ dependencies {
     testImplementation(libs.assertj.core)
     testImplementation(libs.mockito.core)
     testImplementation(libs.mockito.junit)
-    testImplementation(platform(libs.testcontainers.bom))
-    testImplementation(libs.testcontainers.kafka)
-    testImplementation(libs.testcontainers.junit)
     testImplementation(libs.archunit.junit5)
     testImplementation(libs.logback.classic)
 }

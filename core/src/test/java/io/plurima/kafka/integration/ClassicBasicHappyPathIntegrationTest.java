@@ -61,7 +61,7 @@ class ClassicBasicHappyPathIntegrationTest {
         Map<Integer, List<Long>> observed = new ConcurrentHashMap<>();
         CountDownLatch latch = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -101,7 +101,7 @@ class ClassicBasicHappyPathIntegrationTest {
         // 3) Start a second consumer in the same group. If commits succeeded, the broker has
         // recorded the offset+1 position for every partition, so this consumer sees nothing.
         CountDownLatch secondLatch = new CountDownLatch(1);
-        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -137,7 +137,7 @@ class ClassicBasicHappyPathIntegrationTest {
         }
 
         CountDownLatch latch = new CountDownLatch(count);
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)

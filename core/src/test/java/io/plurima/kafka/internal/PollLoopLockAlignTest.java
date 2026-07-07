@@ -35,7 +35,7 @@ class PollLoopLockAlignTest {
         loop = new PollLoop(
             consumer, noop, coordinator, registry, gate,
             Duration.ofMillis(50), configured, Duration.ofSeconds(2), configured,
-            PlurimaMetrics.noOp(), "t", null, null, null, explicit);
+            PlurimaMetrics.noOp(), "t", "g1", null, null, null, explicit);
         loopThread = new Thread(loop, "test-lock-align");
         loopThread.setDaemon(true);
         loopThread.start();

@@ -77,7 +77,7 @@ class ClassicBasicCrossClusterOrderingIntegrationTest {
         RecordListener<byte[], byte[]> listenerA = recordingListener("A", perConsumerPerKey, latch);
         RecordListener<byte[], byte[]> listenerB = recordingListener("B", perConsumerPerKey, latch);
 
-        PlurimaConsumer<byte[], byte[]> consumerA = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumerA = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -86,7 +86,7 @@ class ClassicBasicCrossClusterOrderingIntegrationTest {
             .pollTimeout(Duration.ofMillis(200))
             .listener(listenerA)
             .build();
-        PlurimaConsumer<byte[], byte[]> consumerB = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumerB = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -208,7 +208,7 @@ class ClassicBasicCrossClusterOrderingIntegrationTest {
             latch.countDown();
         };
 
-        PlurimaConsumer<byte[], byte[]> consumerA = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumerA = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -217,7 +217,7 @@ class ClassicBasicCrossClusterOrderingIntegrationTest {
             .pollTimeout(Duration.ofMillis(200))
             .listener(listenerA)
             .build();
-        PlurimaConsumer<byte[], byte[]> consumerB = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumerB = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)

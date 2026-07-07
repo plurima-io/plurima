@@ -68,7 +68,7 @@ class ShareAdaptiveBarrierIntegrationTest {
         java.util.Set<String> processed = ConcurrentHashMap.newKeySet();
         AtomicInteger calls = new AtomicInteger();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(consumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.SHARE)

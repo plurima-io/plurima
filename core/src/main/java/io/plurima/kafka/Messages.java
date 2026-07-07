@@ -25,8 +25,8 @@ public final class Messages {
     private Messages() {}
 
     /** A message carrying only {@code value} (null key), deliveryCount 1. */
-    public static <V> Message<byte[], V> of(V value) {
-        return Messages.<byte[], V>builder(null, value).build();
+    public static <K, V> Message<K, V> of(V value) {
+        return Messages.<K, V>builder(null, value).build();
     }
 
     /** A message carrying {@code key} and {@code value}, deliveryCount 1. */
@@ -35,7 +35,7 @@ public final class Messages {
     }
 
     /** A message with an explicit {@code deliveryCount} (e.g. to test redelivery branches). */
-    public static <K, V> Message<K, V> of(K key, V value, short deliveryCount) {
+    public static <K, V> Message<K, V> of(K key, V value, int deliveryCount) {
         return builder(key, value).deliveryCount(deliveryCount).build();
     }
 
@@ -53,7 +53,7 @@ public final class Messages {
         private int partition = 0;
         private long offset = 0L;
         private long timestampMillis = 0L;
-        private short deliveryCount = 1;
+        private int deliveryCount = 1;
         private OrderingMode orderingMode = OrderingMode.UNORDERED;
         private final Headers headers = new RecordHeaders();
 
@@ -66,11 +66,17 @@ public final class Messages {
         public Builder<K, V> partition(int partition) { this.partition = partition; return this; }
         public Builder<K, V> offset(long offset) { this.offset = offset; return this; }
         public Builder<K, V> timestampMillis(long ms) { this.timestampMillis = ms; return this; }
-        public Builder<K, V> deliveryCount(short deliveryCount) { this.deliveryCount = deliveryCount; return this; }
+        public Builder<K, V> deliveryCount(int deliveryCount) { this.deliveryCount = deliveryCount; return this; }
         public Builder<K, V> orderingMode(OrderingMode orderingMode) { this.orderingMode = orderingMode; return this; }
         public Builder<K, V> header(String name, byte[] value) { this.headers.add(name, value); return this; }
 
         public Message<K, V> build() {
+            // ConsumerRecord's native deliveryCount field is a short (the KIP-932 wire shape);
+            // fail fast rather than silently truncate a caller-supplied value that doesn't fit.
+            if (deliveryCount < Short.MIN_VALUE || deliveryCount > Short.MAX_VALUE) {
+                throw new IllegalArgumentException(
+                    "deliveryCount must fit in a short (KIP-932 wire shape), was " + deliveryCount);
+            }
             ConsumerRecord<K, V> record = new ConsumerRecord<>(
                 topic, partition, offset,
                 timestampMillis, TimestampType.CREATE_TIME,
@@ -78,7 +84,7 @@ public final class Messages {
                 key, value,
                 headers,
                 Optional.empty(),                 // leaderEpoch
-                Optional.of(deliveryCount));
+                Optional.of((short) deliveryCount));
             return new RecordMessage<>(record, deliveryCount, orderingMode);
         }
     }

@@ -48,7 +48,7 @@ class ClassicBasicShutdownDrainIntegrationTest {
         AtomicBoolean handlerInterrupted = new AtomicBoolean();
         AtomicLong handlerDurationMs = new AtomicLong(-1);
 
-        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -96,7 +96,7 @@ class ClassicBasicShutdownDrainIntegrationTest {
         // Verifier in same group: must see NOTHING — the handler ran, committed, and
         // the next consumer starts past the committed offset.
         CountDownLatch redelivered = new CountDownLatch(1);
-        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -128,7 +128,7 @@ class ClassicBasicShutdownDrainIntegrationTest {
         CountDownLatch handlerEntered = new CountDownLatch(1);
         AtomicBoolean handlerInterrupted = new AtomicBoolean();
 
-        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -163,7 +163,7 @@ class ClassicBasicShutdownDrainIntegrationTest {
 
         // The record should be redelivered (we abandoned before commit).
         CountDownLatch redelivered = new CountDownLatch(1);
-        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)

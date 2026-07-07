@@ -40,7 +40,7 @@ class ShareHighVolumeIntegrationTest {
         CountDownLatch done = new CountDownLatch(total);
         Properties props = KafkaIntegrationSupport.consumerProps(groupId);
 
-        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(props)
             .topic(topic)
             .concurrency(50)

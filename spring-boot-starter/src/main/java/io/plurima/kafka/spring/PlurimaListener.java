@@ -24,10 +24,17 @@ import java.lang.annotation.Target;
  *   <li>Typed key/value deserializers — annotation methods can't carry generic
  *       type information through reflection.</li>
  * </ul>
+ *
+ * <p>{@code ElementType.ANNOTATION_TYPE} is included in {@code @Target} so this annotation
+ * can be used as a meta-annotation on a user-defined composed annotation (e.g.
+ * {@code @OrdersListener} fixing {@code groupId} and aliasing {@code topics} via
+ * {@code @AliasFor}). The post-processor resolves such composed annotations via
+ * {@code AnnotatedElementUtils.findMergedAnnotation}, which merges {@code @AliasFor}
+ * attribute overrides — plain {@code AnnotationUtils.findAnnotation} does not.
  */
 @Stable(since = "0.1.0")
 @Retention(RetentionPolicy.RUNTIME)
-@Target(ElementType.METHOD)
+@Target({ElementType.METHOD, ElementType.ANNOTATION_TYPE})
 public @interface PlurimaListener {
 
     /** Topics to subscribe to. Currently exactly one topic is supported. */
@@ -40,7 +47,13 @@ public @interface PlurimaListener {
     OrderingMode ordering() default OrderingMode.UNORDERED;
 
     /**
-     * Max in-flight records. Default 50.
+     * Max in-flight records. Default {@code "50"}.
+     *
+     * <p>A {@code String} (rather than {@code int}) so it supports Spring
+     * {@code ${...}} property placeholders, e.g.
+     * {@code concurrency = "${orders.concurrency:50}"}. The post-processor resolves
+     * the placeholder and parses the result as a positive integer at startup; a
+     * non-numeric or non-positive value fails fast with a descriptive error.
      *
      * <p>On {@link ConsumerEngine#SHARE SHARE}: bounds in-flight via a semaphore;
      * also caps {@code max.poll.records} when the user hasn't set it.
@@ -50,7 +63,7 @@ public @interface PlurimaListener {
      * resume at ≤ concurrency / 2) and is also the default seed for {@code shardCount}
      * under KEY mode ({@code shardCount = concurrency × 4}).
      */
-    int concurrency() default 50;
+    String concurrency() default "50";
 
     /**
      * Underlying consumer engine. Default {@link ConsumerEngine#SHARE}; use

@@ -54,7 +54,7 @@ public class PlurimaListenerContainer implements SmartLifecycle {
         try {
             for (PlurimaListenerEndpoint endpoint : postProcessor.endpoints()) {
                 Properties props = buildKafkaProperties(endpoint);
-                PlurimaConsumerBuilder<byte[], byte[]> builder = PlurimaConsumer.<byte[], byte[]>builder()
+                PlurimaConsumerBuilder<byte[], byte[]> builder = PlurimaConsumer.builder()
                     .kafkaProperties(props)
                     .topic(endpoint.topic())
                     .engine(endpoint.engine())
@@ -66,10 +66,18 @@ public class PlurimaListenerContainer implements SmartLifecycle {
                     builder.retry(beanFactory.getBean(endpoint.retryPolicyBeanName(), RetryPolicy.class));
                 }
                 if (!endpoint.dltConfigBeanName().isEmpty()) {
-                    builder.deadLetterTopic(beanFactory.getBean(endpoint.dltConfigBeanName(), DltConfig.class));
+                    builder.deadLetter(beanFactory.getBean(endpoint.dltConfigBeanName(), DltConfig.class));
                 }
                 if (metrics != null) {
-                    builder.metrics(metrics);
+                    // Wrap the SHARED metrics bean per endpoint in a close-suppressing
+                    // delegate: each consumer runtime calls metrics.close() in its own
+                    // cleanup, and (with the Micrometer adapter) that would deregister
+                    // EVERY endpoint's gauges the first time any one consumer closes or
+                    // fails. The shared bean's lifecycle belongs to Spring / the meter
+                    // registry — never to an individual consumer. See
+                    // CloseSuppressingPlurimaMetrics for the full rationale. The
+                    // container's own stop() likewise never calls the adapter's close().
+                    builder.metrics(new CloseSuppressingPlurimaMetrics(metrics));
                 }
 
                 PlurimaConsumer<byte[], byte[]> consumer = builder.build();
@@ -112,7 +120,15 @@ public class PlurimaListenerContainer implements SmartLifecycle {
         props.put("bootstrap.servers", properties.getBootstrapServers());
         props.put("group.id", endpoint.groupId());
         if (properties.getClientId() != null) {
-            props.put("client.id", properties.getClientId());
+            // Suffix per endpoint (spring-kafka style) — one global plurima.client-id shared
+            // across multiple @PlurimaListener methods would otherwise produce identical
+            // client.id values, colliding on the same Kafka client MBean name and the same
+            // Micrometer gauge tag set (registerInFlightGauge/registerBarrierTimeoutGauge are
+            // tagged by client_id). beanName#methodName is already unique per registered
+            // endpoint and human-readable in JMX, so it's used directly rather than a bare
+            // running index.
+            props.put("client.id",
+                properties.getClientId() + "-" + endpoint.beanName() + "-" + endpoint.methodName());
         }
         return props;
     }

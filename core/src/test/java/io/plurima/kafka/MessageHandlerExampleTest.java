@@ -1,6 +1,7 @@
 package io.plurima.kafka;
 
 import io.plurima.kafka.ack.AckMessage;
+import io.plurima.kafka.ack.AckType;
 import io.plurima.kafka.ack.MessageAckListener;
 import org.junit.jupiter.api.Test;
 
@@ -65,22 +66,22 @@ class MessageHandlerExampleTest {
             else msg.accept();
         };
 
-        RecordingAckMessage<String, String> first = new RecordingAckMessage<>("k", "v", (short) 1);
-        RecordingAckMessage<String, String> retriedTooMuch = new RecordingAckMessage<>("k", "v", (short) 4);
+        RecordingAckMessage<String, String> first = new RecordingAckMessage<>("k", "v", 1);
+        RecordingAckMessage<String, String> retriedTooMuch = new RecordingAckMessage<>("k", "v", 4);
 
         handler.onMessage(first);
         handler.onMessage(retriedTooMuch);
 
-        assertThat(first.acked).isEqualTo(org.apache.kafka.clients.consumer.AcknowledgeType.ACCEPT);
-        assertThat(retriedTooMuch.acked).isEqualTo(org.apache.kafka.clients.consumer.AcknowledgeType.REJECT);
+        assertThat(first.acked).isEqualTo(AckType.ACCEPT);
+        assertThat(retriedTooMuch.acked).isEqualTo(AckType.REJECT);
     }
 
     /** Minimal test double for AckMessage so explicit-ack handlers are unit-testable too. */
     private static final class RecordingAckMessage<K, V> implements AckMessage<K, V> {
-        private final K key; private final V value; private final short dc;
-        org.apache.kafka.clients.consumer.AcknowledgeType acked;
-        RecordingAckMessage(K key, V value, short dc) { this.key = key; this.value = value; this.dc = dc; }
-        @Override public void acknowledge(org.apache.kafka.clients.consumer.AcknowledgeType type) { this.acked = type; }
+        private final K key; private final V value; private final int dc;
+        AckType acked;
+        RecordingAckMessage(K key, V value, int dc) { this.key = key; this.value = value; this.dc = dc; }
+        @Override public void acknowledge(AckType type) { this.acked = type; }
         @Override public K key() { return key; }
         @Override public V value() { return value; }
         @Override public String topic() { return "t"; }
@@ -88,11 +89,14 @@ class MessageHandlerExampleTest {
         @Override public long offset() { return 0; }
         @Override public java.time.Instant timestamp() { return java.time.Instant.EPOCH; }
         @Override public java.util.Optional<byte[]> header(String name) { return java.util.Optional.empty(); }
-        @Override public org.apache.kafka.common.header.Headers headers() {
-            return new org.apache.kafka.common.header.internals.RecordHeaders();
+        @Override public MessageHeaders headers() {
+            return new MessageHeaders() {
+                @Override public List<byte[]> values(String name) { return List.of(); }
+                @Override public java.util.Optional<byte[]> lastValue(String name) { return java.util.Optional.empty(); }
+                @Override public java.util.Set<String> names() { return java.util.Set.of(); }
+            };
         }
-        @Override public short deliveryCount() { return dc; }
-        @Override public java.util.Optional<Short> deliveryCountOptional() { return java.util.Optional.of(dc); }
+        @Override public int deliveryCount() { return dc; }
         @Override public OrderingMode orderingMode() { return OrderingMode.UNORDERED; }
     }
 }

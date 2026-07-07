@@ -31,7 +31,7 @@ public final class QuickstartApp {
         CountDownLatch processed = new CountDownLatch(RECORD_COUNT);
         Set<String> values = ConcurrentHashMap.newKeySet();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(helpers.shareConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.SHARE)

@@ -19,7 +19,7 @@ class MessageListenerBuilderTest {
 
     @Test
     void onMessageBuildsSuccessfully() {
-        PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
             .kafkaProperties(props())
             .topic("t")
             .onMessage(msg -> { /* handle */ })
@@ -29,7 +29,7 @@ class MessageListenerBuilderTest {
 
     @Test
     void onMessageAckBuildsSuccessfully() {
-        PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
             .kafkaProperties(props())
             .topic("t")
             .onMessageAck(AckMessageHelper::acceptAll)
@@ -41,7 +41,7 @@ class MessageListenerBuilderTest {
     void onMessageAndOnMessageAckAreMutuallyExclusive() {
         // onMessage sets the auto-ack listener, onMessageAck sets the manual-ack listener →
         // build() rejects having both (same guard as listener + manualAckListener).
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder()
+        assertThatThrownBy(() -> PlurimaConsumer.builder()
             .kafkaProperties(props())
             .topic("t")
             .onMessage(msg -> { })
@@ -54,7 +54,7 @@ class MessageListenerBuilderTest {
     void duplicateHandlerInSameAutoBucketIsRejectedImmediately() {
         // listener + onMessage both target the auto-ack bucket; setting both must be rejected
         // (exactly one handler), not silently overwrite.
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder()
+        assertThatThrownBy(() -> PlurimaConsumer.builder()
             .topic("t")
             .listener((r, ctx) -> { })
             .onMessage(msg -> { }))
@@ -64,7 +64,7 @@ class MessageListenerBuilderTest {
 
     @Test
     void listenerThenManualAckIsRejectedAtTheSecondCall() {
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder()
+        assertThatThrownBy(() -> PlurimaConsumer.builder()
             .topic("t")
             .listener((r, ctx) -> { })
             .manualAckListener((r, ack) -> { }))
@@ -74,17 +74,17 @@ class MessageListenerBuilderTest {
 
     @Test
     void onMessageRejectsNull() {
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder().onMessage(null))
+        assertThatThrownBy(() -> PlurimaConsumer.builder().onMessage(null))
             .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder().onMessageAck(null))
+        assertThatThrownBy(() -> PlurimaConsumer.builder().onMessageAck(null))
             .isInstanceOf(NullPointerException.class);
     }
 
     @Test
     void listenerAndManualAckListenerRejectNull() {
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder().listener(null))
+        assertThatThrownBy(() -> PlurimaConsumer.builder().listener(null))
             .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder().manualAckListener(null))
+        assertThatThrownBy(() -> PlurimaConsumer.builder().manualAckListener(null))
             .isInstanceOf(NullPointerException.class);
     }
 
@@ -92,7 +92,7 @@ class MessageListenerBuilderTest {
     void rejectedNullListenerDoesNotWedgeTheBuilder() {
         // Null is rejected BEFORE the handler-configured flag is set, so a real handler can still
         // be configured afterwards (the builder isn't left half-configured / "already configured").
-        PlurimaConsumerBuilder<byte[], byte[]> b = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumerBuilder<byte[], byte[]> b = PlurimaConsumer.builder()
             .kafkaProperties(props()).topic("t");
         try { b.listener(null); } catch (NullPointerException expected) { /* rejected pre-mark */ }
         assertThat(b.onMessage(msg -> { }).build()).isNotNull();

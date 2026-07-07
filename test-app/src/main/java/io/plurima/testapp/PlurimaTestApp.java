@@ -147,7 +147,7 @@ public final class PlurimaTestApp {
         // before we produce. Without this, brokers without share.auto.offset.reset=earliest
         // configured (the default) would have the group start at the latest end and miss
         // anything produced before subscribe.
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.shareConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.SHARE)
@@ -180,7 +180,7 @@ public final class PlurimaTestApp {
 
     private static void scenarioShareKeyRejected() {
         try {
-            PlurimaConsumer.<byte[], byte[]>builder()
+            PlurimaConsumer.builder()
                 .kafkaProperties(new Properties())
                 .topic("t")
                 .listener((r, ctx) -> {})
@@ -197,7 +197,7 @@ public final class PlurimaTestApp {
 
     private static void scenarioSharePartitionRejected() {
         try {
-            PlurimaConsumer.<byte[], byte[]>builder()
+            PlurimaConsumer.builder()
                 .kafkaProperties(new Properties())
                 .topic("t")
                 .listener((r, ctx) -> {})
@@ -231,7 +231,7 @@ public final class PlurimaTestApp {
             }
         }
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -273,7 +273,7 @@ public final class PlurimaTestApp {
             }
         }
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -327,7 +327,7 @@ public final class PlurimaTestApp {
         CountDownLatch done = new CountDownLatch(distinctKeys);
         long startNanos;
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -383,7 +383,7 @@ public final class PlurimaTestApp {
         AtomicInteger maxConcurrent = new AtomicInteger();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -448,7 +448,7 @@ public final class PlurimaTestApp {
         // the OTHER shards advanced past offset 0 while offset 0 is still blocked.
         CountDownLatch enoughFastDone = new CountDownLatch(1);
 
-        PlurimaConsumer<byte[], byte[]> first = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> first = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -499,7 +499,7 @@ public final class PlurimaTestApp {
         CountDownLatch sawSomething = new CountDownLatch(1);
         List<Long> secondOffsets = new CopyOnWriteArrayList<>();
 
-        try (PlurimaConsumer<byte[], byte[]> second = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> second = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -552,7 +552,7 @@ public final class PlurimaTestApp {
         AtomicInteger invocations = new AtomicInteger();
         CountDownLatch done = new CountDownLatch(1);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(props)
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -582,7 +582,7 @@ public final class PlurimaTestApp {
         // Verifier in same group must see nothing — proves the commit landed.
         AtomicInteger verifierSaw = new AtomicInteger();
         CountDownLatch verifyDeadline = new CountDownLatch(1);
-        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -621,7 +621,7 @@ public final class PlurimaTestApp {
         AtomicInteger concurrentlyRunning = new AtomicInteger();
         AtomicInteger maxConcurrent = new AtomicInteger();
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(props)
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -680,7 +680,7 @@ public final class PlurimaTestApp {
             .retryOn(RuntimeException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -712,7 +712,7 @@ public final class PlurimaTestApp {
         // Verifier: same group, must see nothing (the success-after-retry committed).
         AtomicInteger verifierSaw = new AtomicInteger();
         CountDownLatch verifyDeadline = new CountDownLatch(1);
-        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -766,13 +766,13 @@ public final class PlurimaTestApp {
             .namingStrategy(sourceTopic -> dltName)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
                 .ordering(OrderingMode.PARTITION)
                 .retry(policy)
-                .deadLetterTopic(dltConfig)
+                .deadLetter(dltConfig)
                 .pollTimeout(Duration.ofMillis(200))
                 .listener((r, ctx) -> {
                     invocations.incrementAndGet();
@@ -834,7 +834,7 @@ public final class PlurimaTestApp {
         java.util.Set<Long> initiallySeen =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(h.shareConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.SHARE)
@@ -844,11 +844,11 @@ public final class PlurimaTestApp {
                 .manualAckListener((r, ack) -> {
                     initiallySeen.add(r.offset());
                     if (r.offset() == 0L) ack.acknowledge(
-                        org.apache.kafka.clients.consumer.AcknowledgeType.ACCEPT);
+                        io.plurima.kafka.ack.AckType.ACCEPT);
                     else if (r.offset() == 1L) ack.acknowledge(
-                        org.apache.kafka.clients.consumer.AcknowledgeType.REJECT);
+                        io.plurima.kafka.ack.AckType.REJECT);
                     else if (r.offset() == 2L) ack.acknowledge(
-                        org.apache.kafka.clients.consumer.AcknowledgeType.RELEASE);
+                        io.plurima.kafka.ack.AckType.RELEASE);
                     acked.countDown();
                 })
                 .build()) {
@@ -896,7 +896,7 @@ public final class PlurimaTestApp {
             }
         }
 
-        try (PlurimaConsumer<byte[], String> c = PlurimaConsumer.<byte[], String>builder()
+        try (PlurimaConsumer<byte[], String> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -944,7 +944,7 @@ public final class PlurimaTestApp {
         AtomicReference<String> header = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.shareConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.SHARE)
@@ -990,7 +990,7 @@ public final class PlurimaTestApp {
         AtomicInteger invocations = new AtomicInteger();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.shareConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.SHARE)
@@ -1027,7 +1027,7 @@ public final class PlurimaTestApp {
         AtomicInteger invocations = new AtomicInteger();
         CountDownLatch first = new CountDownLatch(1);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.shareConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.SHARE)
@@ -1068,7 +1068,7 @@ public final class PlurimaTestApp {
         AtomicInteger invocations = new AtomicInteger();
         CountDownLatch done = new CountDownLatch(total);
 
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.shareConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.SHARE)

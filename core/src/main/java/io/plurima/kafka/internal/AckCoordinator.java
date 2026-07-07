@@ -1,16 +1,17 @@
 package io.plurima.kafka.internal;
 
 import io.plurima.kafka.annotation.Internal;
+import io.plurima.kafka.metrics.AckOutcome;
 import io.plurima.kafka.metrics.PlurimaMetrics;
+import io.plurima.kafka.metrics.ProcessResult;
 import org.apache.kafka.clients.consumer.AcknowledgeType;
 import org.apache.kafka.clients.consumer.AcknowledgementCommitCallback;
 import org.apache.kafka.clients.consumer.ShareConsumer;
+import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicIdPartition;
-import org.apache.kafka.common.errors.InvalidRecordStateException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
@@ -103,11 +104,11 @@ public final class AckCoordinator implements AcknowledgementCommitCallback {
             return;
         }
         pending.offer(new AckRequest(r, type));
-        metrics.ackQueued(type.name());
+        metrics.ackQueued(toAckOutcome(type));
         // Centralized recordsProcessed emission. Previously only WorkerProcessor's auto-ack
         // success path fired this metric, so manual-ack ACCEPT/REJECT and ListenerInvoker's
         // auto-RELEASE-on-no-ack were invisible.
-        metrics.recordsProcessed(r.coord().topic(), type.name().toLowerCase(Locale.ROOT));
+        metrics.recordsProcessed(r.coord().topic(), toProcessResult(type));
         // Terminal outcome (ACCEPT/REJECT) → the coord will be done once its commit confirms. Mark
         // it for slowness-clear, but DON'T clear yet: the clear happens in onComplete on commit
         // success, so a failed commit (record redelivered) keeps its slowness subtraction. RELEASE
@@ -148,9 +149,18 @@ public final class AckCoordinator implements AcknowledgementCommitCallback {
      *
      * <p>Note: {@link InFlightRegistry#complete(InFlightRecord)} is the <em>worker's</em>
      * responsibility (called in the worker's {@code finally} block) for the normal path.
-     * This method retains the {@code registry.complete} call only in the
-     * {@link InvalidRecordStateException} recovery path, where the worker may already
-     * have exited without clearing the record.
+     * This method retains the {@code registry.complete} call only in the recovery paths
+     * for a rejected acknowledge (the invalid-record-state / lease-expired case and the
+     * broader broker-side {@code KafkaException} family, plus the
+     * {@code IllegalStateException} record-not-waiting case), where the worker may
+     * already have exited without clearing the record.
+     *
+     * <p><b>Exceptions that are NOT recovered:</b> {@code WakeupException} and
+     * {@code InterruptException} (shutdown control flow) and
+     * {@code AuthenticationException} / {@code AuthorizationException} (persistent,
+     * fatal per Kafka client conventions) are rethrown so the poll loop's fatal/shutdown
+     * machinery engages instead of silently redelivering forever — see the catch blocks
+     * below.
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
     public void commitPendingAcks(ShareConsumer<?, ?> consumer) {
@@ -163,14 +173,51 @@ public final class AckCoordinator implements AcknowledgementCommitCallback {
                 // form is documented for poison-pill records only and is rejected by the broker
                 // for normal records — "The record cannot be acknowledged.").
                 ((ShareConsumer) consumer).acknowledge(req.record().consumerRecord(), req.type());
-                metrics.ackCommitted(req.coord().topic(), req.type().name());
-            } catch (InvalidRecordStateException e) {
-                // Lease expired broker-side. By the time commitPendingAcks runs, the worker
-                // (or forceReleaseStuckRecords) has already completed the registry entry — so
-                // the complete() call here is a no-op safety net. We don't need to release a
-                // permit because the rightful owner already did so when they won the
-                // identity-aware complete race.
-                log.warn("Acknowledge failed (lease expired) for {}: {}",
+                metrics.ackCommitted(req.coord().topic(), toAckOutcome(req.type()));
+            } catch (org.apache.kafka.common.errors.WakeupException e) {
+                // WakeupException extends KafkaException, so it would otherwise be
+                // swallowed by the broader catch below and treated as a completed ack
+                // failure — silently absorbing the shutdown signal PollLoop.shutdown()
+                // relies on. ShareConsumer.acknowledge() is local bookkeeping (no network
+                // call) and does not throw this in practice, but we rethrow explicitly
+                // rather than depend on that implementation detail; a future client
+                // version that makes acknowledge() wakeup-aware must not have its wakeup
+                // absorbed here.
+                throw e;
+            } catch (org.apache.kafka.common.errors.InterruptException
+                     | org.apache.kafka.common.errors.AuthenticationException
+                     | org.apache.kafka.common.errors.AuthorizationException fatal) {
+                // These KafkaException subtypes must NOT fall into the complete-and-
+                // continue recovery below:
+                //  - InterruptException is the client's unchecked wrapper for thread
+                //    interruption — shutdown CONTROL FLOW, not a per-record ack failure.
+                //    Swallowing it would absorb the stop signal (worker-pool shutdownNow /
+                //    poll-thread interrupt) the shutdown path relies on.
+                //  - Authentication/AuthorizationException are persistent per Kafka client
+                //    conventions: every subsequent acknowledge fails identically, so
+                //    complete-and-continue would degrade into infinite redelivery with the
+                //    consumer still reporting RUNNING and onFatalError never firing.
+                // Rethrow so PollLoop.run()'s fatal path (FAILED state transition + the
+                // user's onFatalError callback) engages fast.
+                throw fatal;
+            } catch (KafkaException e) {
+                // Broker/lease-side acknowledge failure — e.g. an invalid-record-state
+                // error (lease expired) or any other KafkaException subtype the broker or
+                // client raises for this specific record (timeouts, disconnects, etc.).
+                // Previously only the invalid-record-state case was caught here; any other
+                // KafkaException subtype propagated out of this loop, past drainAndCommit,
+                // and into PollLoop.run()'s outer catch(Throwable) — which treats it as
+                // FATAL and stops the ENTIRE poll thread over what is really a
+                // single-record ack failure. Catching the broader KafkaException hierarchy
+                // applies the same complete-and-continue recovery uniformly — EXCEPT the
+                // control-flow / fatal-by-convention subtypes rethrown above: by the time
+                // commitPendingAcks runs, the worker (or forceReleaseStuckRecords) has
+                // already completed the registry entry, so the complete() call here is a
+                // no-op safety net. We don't need to release a permit because the rightful
+                // owner already did so when they won the identity-aware complete race. A
+                // truly unknown Throwable (not a KafkaException) is NOT caught here — it
+                // still propagates and is correctly treated as fatal.
+                log.warn("Acknowledge failed (broker/lease error) for {}: {}",
                     req.coord(), e.getMessage());
                 dropPendingSlownessClear(req);
                 registry.complete(req.record());
@@ -201,5 +248,33 @@ public final class AckCoordinator implements AcknowledgementCommitCallback {
         if (slownessTracker != null) {
             pendingSlownessClear.remove(req.coord());
         }
+    }
+
+    /**
+     * Maps the broker-facing {@link AcknowledgeType} to the metrics-facing
+     * {@link AckOutcome}. Package-private so {@link PollLoop#acknowledgeDirectly} can
+     * reuse it for its own {@code ackCommitted} emission on the duplicate-coord path.
+     * {@code RENEW} never reaches Plurima's ack-queue/commit metrics — it is a
+     * lock-renewal signal, not a terminal or queueable outcome.
+     */
+    static AckOutcome toAckOutcome(AcknowledgeType type) {
+        return switch (type) {
+            case ACCEPT -> AckOutcome.ACCEPT;
+            case RELEASE -> AckOutcome.RELEASE;
+            case REJECT -> AckOutcome.REJECT;
+            case RENEW -> throw new IllegalArgumentException(
+                "RENEW is not an ack outcome Plurima queues or commits: " + type);
+        };
+    }
+
+    /** Maps the broker-facing {@link AcknowledgeType} to the metrics-facing {@link ProcessResult}. */
+    private static ProcessResult toProcessResult(AcknowledgeType type) {
+        return switch (type) {
+            case ACCEPT -> ProcessResult.ACCEPT;
+            case RELEASE -> ProcessResult.RELEASE;
+            case REJECT -> ProcessResult.REJECT;
+            case RENEW -> throw new IllegalArgumentException(
+                "RENEW is not a process result Plurima records: " + type);
+        };
     }
 }

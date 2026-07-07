@@ -55,18 +55,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       - name: Wait for Kafka broker
         run: |
@@ -88,7 +88,7 @@ jobs:
 
       - name: Upload test reports on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: integration-test-reports
           path: |
@@ -104,18 +104,29 @@ jobs:
     name: Publish release to Central Portal
     needs: integration-tests
     runs-on: ubuntu-latest
+    # NOTE (repo-side manual setup — cannot be done from this repo, must be
+    # configured in GitHub Settings by someone with admin access):
+    #   1. Settings > Environments > create an environment named "release".
+    #   2. Add required reviewers on the "release" environment so publishing
+    #      pauses for manual approval before secrets are exposed to the job.
+    #   3. Settings > Tags > Rulesets (or branch/tag protection) > add a tag
+    #      protection rule for "v*" so only authorized actors can push/delete
+    #      release tags.
+    environment: release
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       - name: Refuse non-tag refs
         # Releases MUST come from a tag pushed to master. Even though workflow_dispatch
@@ -137,7 +148,7 @@ jobs:
             echo "REFUSING to publish: release tag must be vX.Y.Z, got '${GITHUB_REF}'."
             exit 1
           fi
-          git fetch origin master --depth=1
+          git fetch origin master
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
             echo "REFUSING to publish: release tag commit is not reachable from origin/master."
             exit 1

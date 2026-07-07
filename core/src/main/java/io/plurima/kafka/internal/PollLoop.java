@@ -11,11 +11,13 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.CorruptRecordException;
 import org.apache.kafka.common.errors.RecordDeserializationException;
 import org.apache.kafka.common.errors.WakeupException;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 @Internal
 public final class PollLoop implements Runnable, AutoCloseable {
@@ -47,6 +49,8 @@ public final class PollLoop implements Runnable, AutoCloseable {
     private final boolean lockDurationExplicitlySet;
     private final PlurimaMetrics metrics;
     private final String boundTopic;
+    /** Consumer group id, for the {@code group_id} tag on {@code plurima.consumer.poll.duration}. */
+    private final String groupId;
     /**
      * Called from the poll thread's {@code finally} block after the loop exits — on
      * normal shutdown OR on a fatal {@code Throwable}. ShareConsumerRuntime uses this to
@@ -54,6 +58,16 @@ public final class PollLoop implements Runnable, AutoCloseable {
      * or DltRouter. {@code null} for legacy/test constructors that don't wire one up.
      */
     private final Runnable onLoopExit;
+    /**
+     * Fatal-error hook (B6). Invoked from {@link #run()}'s finally block ONLY when the
+     * loop exited via the generic {@code catch (Throwable t)} branch below — i.e. an
+     * unrecoverable error, not a normal shutdown — and only in place of (never in
+     * addition to) {@link #onLoopExit}. {@code null} for legacy/test constructors that
+     * don't wire one up; in that case {@link #onLoopExit} still fires on the fatal path
+     * so cleanup is never skipped, just without the state-transition/callback semantics
+     * {@code ShareConsumerRuntime.handleFatal} adds.
+     */
+    private final Consumer<Throwable> onFatal;
     private final HandlerLatencyWindow latencyWindow;       // nullable — adaptive off when null
     private final AdaptiveBarrierConfig adaptiveConfig;     // nullable — adaptive off when null
     private volatile long effectiveBarrierMillis;           // exposed via gauge
@@ -78,7 +92,8 @@ public final class PollLoop implements Runnable, AutoCloseable {
         Duration lockDuration,
         Duration shutdownDrainTimeout) {
         this(consumer, dispatcher, coordinator, registry, gate,
-            pollTimeout, lockDuration, shutdownDrainTimeout, lockDuration, PlurimaMetrics.noOp(), "unknown", null);
+            pollTimeout, lockDuration, shutdownDrainTimeout, lockDuration, PlurimaMetrics.noOp(),
+            "unknown", "unknown", null);
     }
 
     public PollLoop(
@@ -93,7 +108,8 @@ public final class PollLoop implements Runnable, AutoCloseable {
         Duration barrierTimeout,
         PlurimaMetrics metrics) {
         this(consumer, dispatcher, coordinator, registry, gate,
-            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, "unknown", null);
+            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics,
+            "unknown", "unknown", null);
     }
 
     /** Full constructor with all parameters including the bound topic for metrics. */
@@ -108,9 +124,10 @@ public final class PollLoop implements Runnable, AutoCloseable {
         Duration shutdownDrainTimeout,
         Duration barrierTimeout,
         PlurimaMetrics metrics,
-        String boundTopic) {
+        String boundTopic,
+        String groupId) {
         this(consumer, dispatcher, coordinator, registry, gate,
-            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, boundTopic, null);
+            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, boundTopic, groupId, null);
     }
 
     /** Full constructor with all parameters including the loop-exit callback. */
@@ -126,9 +143,10 @@ public final class PollLoop implements Runnable, AutoCloseable {
         Duration barrierTimeout,
         PlurimaMetrics metrics,
         String boundTopic,
+        String groupId,
         Runnable onLoopExit) {
         this(consumer, dispatcher, coordinator, registry, gate,
-            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, boundTopic,
+            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, boundTopic, groupId,
             onLoopExit, null, null);
     }
 
@@ -145,11 +163,12 @@ public final class PollLoop implements Runnable, AutoCloseable {
         Duration barrierTimeout,
         PlurimaMetrics metrics,
         String boundTopic,
+        String groupId,
         Runnable onLoopExit,
         HandlerLatencyWindow latencyWindow,
         AdaptiveBarrierConfig adaptiveConfig) {
         this(consumer, dispatcher, coordinator, registry, gate,
-            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, boundTopic,
+            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, boundTopic, groupId,
             onLoopExit, latencyWindow, adaptiveConfig, true);
     }
 
@@ -166,10 +185,39 @@ public final class PollLoop implements Runnable, AutoCloseable {
         Duration barrierTimeout,
         PlurimaMetrics metrics,
         String boundTopic,
+        String groupId,
         Runnable onLoopExit,
         HandlerLatencyWindow latencyWindow,
         AdaptiveBarrierConfig adaptiveConfig,
         boolean lockDurationExplicitlySet) {
+        this(consumer, dispatcher, coordinator, registry, gate,
+            pollTimeout, lockDuration, shutdownDrainTimeout, barrierTimeout, metrics, boundTopic, groupId,
+            onLoopExit, latencyWindow, adaptiveConfig, lockDurationExplicitlySet, null);
+    }
+
+    /**
+     * Full constructor including the fatal-error hook (B6). {@code onFatal} is wired by
+     * {@code ShareConsumerRuntime} to its {@code handleFatal} method; see {@link #onFatal}
+     * for exactly when it fires relative to {@link #onLoopExit}.
+     */
+    public PollLoop(
+        ShareConsumer<byte[], byte[]> consumer,
+        WorkDispatcher dispatcher,
+        AckCoordinator coordinator,
+        InFlightRegistry registry,
+        BackpressureGate gate,
+        Duration pollTimeout,
+        Duration lockDuration,
+        Duration shutdownDrainTimeout,
+        Duration barrierTimeout,
+        PlurimaMetrics metrics,
+        String boundTopic,
+        String groupId,
+        Runnable onLoopExit,
+        HandlerLatencyWindow latencyWindow,
+        AdaptiveBarrierConfig adaptiveConfig,
+        boolean lockDurationExplicitlySet,
+        Consumer<Throwable> onFatal) {
         this.consumer = consumer;
         this.dispatcher = dispatcher;
         this.coordinator = coordinator;
@@ -182,7 +230,9 @@ public final class PollLoop implements Runnable, AutoCloseable {
         this.lockDurationExplicitlySet = lockDurationExplicitlySet;
         this.metrics = metrics;
         this.boundTopic = boundTopic;
+        this.groupId = groupId;
         this.onLoopExit = onLoopExit;
+        this.onFatal = onFatal;
         this.latencyWindow = latencyWindow;
         this.adaptiveConfig = adaptiveConfig;
         this.effectiveBarrierMillis = barrierTimeout.toMillis();
@@ -190,6 +240,7 @@ public final class PollLoop implements Runnable, AutoCloseable {
 
     @Override
     public void run() {
+        Throwable fatal = null;
         try {
             while (running) {
                 if (!acquirePermit()) break;
@@ -208,12 +259,24 @@ public final class PollLoop implements Runnable, AutoCloseable {
         } catch (Throwable t) {
             // Any uncaught error reaching this point is fatal for the poll thread — the
             // loop will exit. Log loudly and let the finally block run drainAndClose +
-            // the onLoopExit callback so callers can release the surrounding runtime
+            // either onFatal (B6: state transition + self-close + user callback) or the
+            // plain onLoopExit callback so callers can release the surrounding runtime
             // (WorkerLauncher, DltRouter) instead of leaving them dangling.
             log.error("Fatal error in PollLoop; consumer will stop", t);
+            fatal = t;
         } finally {
             drainAndClose();
-            if (onLoopExit != null) RuntimeCleanup.logIfRaised("onLoopExit callback", onLoopExit::run);
+            if (fatal != null && onFatal != null) {
+                // onFatal (ShareConsumerRuntime.handleFatal) performs the equivalent of
+                // onLoopExit's cleanup itself (it shares the same doClose() body), plus
+                // the FAILED-state transition and the user's onFatalError callback, in
+                // that order. Calling onLoopExit here too would be redundant (and would
+                // race the state transition — see the class-level note on onFatal).
+                Throwable f = fatal;
+                RuntimeCleanup.logIfRaised("onFatal callback", () -> onFatal.accept(f));
+            } else if (onLoopExit != null) {
+                RuntimeCleanup.logIfRaised("onLoopExit callback", onLoopExit::run);
+            }
         }
     }
 
@@ -233,19 +296,19 @@ public final class PollLoop implements Runnable, AutoCloseable {
      * poll surfaced a poison-pill / corrupt-batch error and we've already REJECTed +
      * released the permit; the caller continues to the next loop iteration.
      */
-    private ConsumerRecords<byte[], byte[]> pollOrHandlePoison() {
+    private @Nullable ConsumerRecords<byte[], byte[]> pollOrHandlePoison() {
         long pollStartNanos = System.nanoTime();
         try {
             ConsumerRecords<byte[], byte[]> batch = consumer.poll(pollTimeout);
-            metrics.recordPollDuration(Duration.ofNanos(System.nanoTime() - pollStartNanos));
+            metrics.recordPollDuration(boundTopic, groupId, Duration.ofNanos(System.nanoTime() - pollStartNanos));
             return batch;
         } catch (RecordDeserializationException e) {
-            metrics.recordPollDuration(Duration.ofNanos(System.nanoTime() - pollStartNanos));
+            metrics.recordPollDuration(boundTopic, groupId, Duration.ofNanos(System.nanoTime() - pollStartNanos));
             rejectPoisonPill(e);
             gate.release(1);
             return null;
         } catch (CorruptRecordException e) {
-            metrics.recordPollDuration(Duration.ofNanos(System.nanoTime() - pollStartNanos));
+            metrics.recordPollDuration(boundTopic, groupId, Duration.ofNanos(System.nanoTime() - pollStartNanos));
             log.warn("Corrupt record batch on topic {}: {}; broker auto-rejected, continuing",
                 boundTopic, e.getMessage());
             metrics.recordsPoisonPill(boundTopic, "corrupt_batch");
@@ -254,6 +317,29 @@ public final class PollLoop implements Runnable, AutoCloseable {
         }
     }
 
+    /**
+     * Handle a deserialization poison pill: a record the broker delivered whose key or
+     * value the {@code ShareConsumer}'s own deserializer could not decode, surfaced by
+     * Kafka as {@link RecordDeserializationException}.
+     *
+     * <p><b>Outcome: REJECTed with a metric, NOT DLT-routed.</b> Plurima's DLT routing
+     * lives entirely on the worker/retry path ({@code RetryEngine} + {@code DltRouter}),
+     * which only ever sees records that were successfully deserialized off the wire and
+     * handed to a worker. A poison pill fails deserialization {@code ShareConsumer}-side,
+     * during {@link #pollOrHandlePoison}, on the poll thread — before any
+     * {@code InFlightRecord} exists, before any worker runs, and before the retry/DLT
+     * machinery is ever reached. There is no well-formed record to hand to a
+     * user-supplied {@code RecordListener} or to serialize onto a DLT topic, so DLT
+     * routing is not offered for this failure mode.
+     *
+     * <p>Instead we REJECT the record directly at the coordinate Kafka reports on the
+     * exception (topic/partition/offset — no {@code ConsumerRecord} instance is
+     * available) so it is not redelivered, and emit
+     * {@code plurima.consumer.records.poison_pill{cause="deserialization"}} so operators
+     * can alert on and locate poison pills operationally. See UserGuide.md's
+     * "Deserialization errors (poison-pill records)" note under § Deserializers for the
+     * user-facing contract.
+     */
     private void rejectPoisonPill(RecordDeserializationException e) {
         String topic = e.topicPartition().topic();
         int partition = e.topicPartition().partition();
@@ -378,7 +464,7 @@ public final class PollLoop implements Runnable, AutoCloseable {
     private void acknowledgeDirectly(ConsumerRecord<byte[], byte[]> raw, AcknowledgeType type) {
         try {
             consumer.acknowledge(raw, type);
-            metrics.ackCommitted(raw.topic(), type.name());
+            metrics.ackCommitted(raw.topic(), AckCoordinator.toAckOutcome(type));
         } catch (Exception e) {
             // Worst case: broker rejects (lease already expired, batch closed, etc.).
             // The drain barrier still trips on next poll if anything is outstanding;
@@ -440,7 +526,7 @@ public final class PollLoop implements Runnable, AutoCloseable {
         return result;
     }
 
-    /** Current effective barrier in millis — backs the plurima.consumer.barrier.timeout_ms gauge. */
+    /** Current effective barrier in millis — backs the plurima.consumer.barrier.timeout gauge. */
     long currentBarrierMillis() {
         return effectiveBarrierMillis;
     }

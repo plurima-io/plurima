@@ -46,7 +46,7 @@ class Phase9HardeningEndToEndTest {
         Properties props = new Properties();
         props.put("bootstrap.servers", BOOTSTRAP);
         props.put("enable.auto.commit", "true");
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder()
+        assertThatThrownBy(() -> PlurimaConsumer.builder()
                 .kafkaProperties(props)
                 .topic("t")
                 .listener((r, ctx) -> {})
@@ -60,7 +60,7 @@ class Phase9HardeningEndToEndTest {
         Properties props = new Properties();
         props.put("bootstrap.servers", BOOTSTRAP);
         props.put("auto.offset.reset", "earliest");
-        assertThatThrownBy(() -> PlurimaConsumer.<byte[], byte[]>builder()
+        assertThatThrownBy(() -> PlurimaConsumer.builder()
                 .kafkaProperties(props)
                 .topic("t")
                 .listener((r, ctx) -> {})
@@ -86,7 +86,7 @@ class Phase9HardeningEndToEndTest {
         cProps.put("share.acknowledgement.mode", "implicit");
 
         CountDownLatch latch = new CountDownLatch(1);
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(cProps)
             .topic(topic)
             .pollTimeout(Duration.ofMillis(200))

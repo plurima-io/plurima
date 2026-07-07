@@ -183,7 +183,7 @@ public final class PlurimaVsVanillaBench {
             Map<String, List<Long>> observed = new ConcurrentHashMap<>();
             CountDownLatch done = new CountDownLatch(total);
             long startNanos;
-            try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+            try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                     .kafkaProperties(h.classicConsumerProps(pGroup))
                     .topic(topic)
                     .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -279,7 +279,7 @@ public final class PlurimaVsVanillaBench {
             AtomicInteger pluInvocations = new AtomicInteger();
             CountDownLatch done = new CountDownLatch(1);
             long pStartNanos = System.nanoTime();
-            try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+            try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                     .kafkaProperties(pluProps)
                     .topic(topic)
                     .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -382,13 +382,13 @@ public final class PlurimaVsVanillaBench {
             String pGroup = "bench-dlt-plurima-" + UUID.randomUUID();
             AtomicInteger pluInvocations = new AtomicInteger();
             long pStartNanos = System.nanoTime();
-            try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+            try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                     .kafkaProperties(h.classicConsumerProps(pGroup))
                     .topic(pTopic)
                     .engine(ConsumerEngine.CLASSIC_BASIC)
                     .ordering(OrderingMode.PARTITION)
                     .retry(policy)
-                    .deadLetterTopic(dltConfig)
+                    .deadLetter(dltConfig)
                     .pollTimeout(Duration.ofMillis(200))
                     .listener((r, ctx) -> {
                         pluInvocations.incrementAndGet();
@@ -436,7 +436,7 @@ public final class PlurimaVsVanillaBench {
         OrderingMode ordering, int handlerMs) throws Exception {
         CountDownLatch done = new CountDownLatch(total);
         long[] startNanos = new long[]{-1};
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -468,7 +468,7 @@ public final class PlurimaVsVanillaBench {
         CountDownLatch done = new CountDownLatch(total);
         long[] startNanos = new long[]{-1};
         // Start consumer FIRST so we don't depend on broker share.auto.offset.reset.
-        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> c = PlurimaConsumer.builder()
                 .kafkaProperties(h.shareConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.SHARE)

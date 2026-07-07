@@ -4,6 +4,7 @@ import io.plurima.kafka.ConsumerContext;
 import io.plurima.kafka.OrderingMode;
 import io.plurima.kafka.RecordListener;
 import io.plurima.kafka.ack.AckContext;
+import io.plurima.kafka.ack.AckType;
 import io.plurima.kafka.ack.ManualAckListener;
 import io.plurima.kafka.annotation.Internal;
 import io.plurima.kafka.deserializer.RecordDeserializer;
@@ -12,7 +13,6 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -152,19 +152,22 @@ public final class ListenerInvoker {
         }
 
         @Override
-        public void acknowledge(AcknowledgeType type) {
-            if (type == AcknowledgeType.RENEW) {
-                // RENEW is non-terminal: returning from the handler would complete the
-                // registry entry while the broker still considered the record acquired.
-                // Plurima does not expose lock renewal — long handlers must rely on a
-                // sufficiently large broker-side group.share.record.lock.duration.ms.
-                log.warn("AckContext.acknowledge(RENEW) is not supported; ignored. Configure a "
-                    + "longer broker-side group.share.record.lock.duration.ms instead.");
-                return;
-            }
+        public void acknowledge(AckType type) {
             if (acked.compareAndSet(false, true)) {
-                coordinator.queueAck(record, type);
+                coordinator.queueAck(record, toKafkaAcknowledgeType(type));
             }
+        }
+
+        // ── AckType → Kafka AcknowledgeType boundary mapping ────────────────
+        // Plurima's public AckType has no RENEW constant (unlike Kafka's AcknowledgeType) — the
+        // invalid-input case this used to warn-and-drop at runtime is now a compile error on the
+        // caller's side, so this mapping is total and needs no fallback branch.
+        private static AcknowledgeType toKafkaAcknowledgeType(AckType type) {
+            return switch (type) {
+                case ACCEPT -> AcknowledgeType.ACCEPT;
+                case RELEASE -> AcknowledgeType.RELEASE;
+                case REJECT -> AcknowledgeType.REJECT;
+            };
         }
 
         boolean wasAcked() { return acked.get(); }
@@ -174,8 +177,7 @@ public final class ListenerInvoker {
             acked.set(true);
         }
 
-        @Override public short deliveryCount()                    { return delegate.deliveryCount(); }
-        @Override public Optional<Short> deliveryCountOptional()  { return delegate.deliveryCountOptional(); }
-        @Override public OrderingMode orderingMode()              { return delegate.orderingMode(); }
+        @Override public int deliveryCount()          { return delegate.deliveryCount(); }
+        @Override public OrderingMode orderingMode()  { return delegate.orderingMode(); }
     }
 }

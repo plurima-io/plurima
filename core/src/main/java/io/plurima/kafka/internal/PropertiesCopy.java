@@ -1,6 +1,7 @@
 package io.plurima.kafka.internal;
 
 import io.plurima.kafka.annotation.Internal;
+import org.jspecify.annotations.Nullable;
 
 import java.util.Properties;
 
@@ -41,7 +42,7 @@ public final class PropertiesCopy {
      *
      * <p>Returns an empty {@link Properties} when {@code src} is {@code null}.
      */
-    public static Properties copy(Properties src) {
+    public static Properties copy(@Nullable Properties src) {
         Properties out = new Properties();
         if (src == null) return out;
         // Step 1: copy all explicit hashtable entries — preserves non-String values.

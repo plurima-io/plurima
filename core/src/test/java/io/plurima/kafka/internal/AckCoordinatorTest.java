@@ -1,6 +1,7 @@
 package io.plurima.kafka.internal;
 
 import io.plurima.kafka.metrics.PlurimaMetrics;
+import io.plurima.kafka.metrics.ProcessResult;
 import org.apache.kafka.clients.consumer.AcknowledgeType;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ShareConsumer;
@@ -100,6 +101,118 @@ class AckCoordinatorTest {
     }
 
     /**
+     * An unexpected {@link org.apache.kafka.common.errors.TimeoutException} (a
+     * {@code KafkaException} subtype distinct from {@code InvalidRecordStateException})
+     * must be treated with the same complete-and-continue semantics: the failing
+     * request's registry entry completes, the drain loop continues to the NEXT queued
+     * request instead of aborting, and the batch still issues {@code commitAsync()} for
+     * whatever did succeed. Before broadening the catch to {@code KafkaException}, this
+     * would have propagated out of {@code commitPendingAcks} entirely — past
+     * {@code drainAndCommit} and into {@code PollLoop.run()}'s outer
+     * {@code catch(Throwable)}, which kills the whole poll thread over one record's ack
+     * failure.
+     */
+    @Test
+    void unexpectedKafkaExceptionCompletesAndContinuesToNextRequest() {
+        InFlightRecord<byte[], byte[]> a = rec("t", 0, 1);
+        InFlightRecord<byte[], byte[]> b = rec("t", 0, 2);
+        doThrow(new org.apache.kafka.common.errors.TimeoutException("broker did not respond"))
+            .when(consumer).acknowledge(
+                org.mockito.ArgumentMatchers.<ConsumerRecord<byte[], byte[]>>argThat(
+                    cr -> cr.topic().equals("t") && cr.partition() == 0 && cr.offset() == 1L),
+                eq(AcknowledgeType.ACCEPT));
+
+        coordinator.queueAck(a, AcknowledgeType.ACCEPT);
+        coordinator.queueAck(b, AcknowledgeType.ACCEPT);
+
+        // Must not propagate — and must not abort before draining b.
+        coordinator.commitPendingAcks(consumer);
+
+        // The failing request's registry entry is completed (safety-net no-op path) —
+        // the succeeding request's entry is untouched here because completing it is the
+        // WORKER's responsibility on the normal path (see commitPendingAcks javadoc).
+        assertThat(registry.isCurrent(a))
+            .as("failing request's registry entry must be completed by the safety-net path")
+            .isFalse();
+        // ...the loop continued to b, whose acknowledge() actually reached the broker...
+        verify(consumer).acknowledge(
+            argThat(cr -> cr.topic().equals("t") && cr.offset() == 2L),
+            eq(AcknowledgeType.ACCEPT));
+        // ...and the batch still committed (anyDrained=true covers both requests).
+        verify(consumer).commitAsync();
+    }
+
+    /**
+     * F8 — fatal-by-convention exceptions must NOT be complete-and-continued. An
+     * {@link org.apache.kafka.common.errors.AuthorizationException} is persistent: every
+     * subsequent acknowledge would fail the same way, so swallowing it means infinite
+     * redelivery while the consumer reports RUNNING and {@code onFatalError} never fires.
+     * It must propagate out of {@code commitPendingAcks} so the poll loop's fatal path
+     * (FAILED state + user callback) engages.
+     */
+    @Test
+    void authorizationExceptionFromAcknowledgePropagatesAsFatal() {
+        InFlightRecord<byte[], byte[]> a = rec("t", 0, 1);
+        doThrow(new org.apache.kafka.common.errors.TopicAuthorizationException("not authorized"))
+            .when(consumer).acknowledge(
+                org.mockito.ArgumentMatchers.<ConsumerRecord<byte[], byte[]>>any(),
+                eq(AcknowledgeType.ACCEPT));
+
+        coordinator.queueAck(a, AcknowledgeType.ACCEPT);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                () -> coordinator.commitPendingAcks(consumer))
+            .as("AuthorizationException is fatal per Kafka client conventions — it must "
+                + "propagate, not be swallowed into complete-and-continue")
+            .isInstanceOf(org.apache.kafka.common.errors.AuthorizationException.class);
+    }
+
+    /** F8 — same as above for {@link org.apache.kafka.common.errors.AuthenticationException}. */
+    @Test
+    void authenticationExceptionFromAcknowledgePropagatesAsFatal() {
+        InFlightRecord<byte[], byte[]> a = rec("t", 0, 1);
+        doThrow(new org.apache.kafka.common.errors.AuthenticationException("bad credentials"))
+            .when(consumer).acknowledge(
+                org.mockito.ArgumentMatchers.<ConsumerRecord<byte[], byte[]>>any(),
+                eq(AcknowledgeType.ACCEPT));
+
+        coordinator.queueAck(a, AcknowledgeType.ACCEPT);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                () -> coordinator.commitPendingAcks(consumer))
+            .isInstanceOf(org.apache.kafka.common.errors.AuthenticationException.class);
+    }
+
+    /**
+     * F8 — {@link org.apache.kafka.common.errors.InterruptException} is shutdown control
+     * flow (the client's unchecked wrapper for thread interruption), not a per-record ack
+     * failure. Swallowing it would absorb the very stop signal the poll loop's shutdown
+     * relies on. It must propagate.
+     */
+    @Test
+    void interruptExceptionFromAcknowledgePropagates() {
+        try {
+            InFlightRecord<byte[], byte[]> a = rec("t", 0, 1);
+            doThrow(new org.apache.kafka.common.errors.InterruptException("interrupted"))
+                .when(consumer).acknowledge(
+                    org.mockito.ArgumentMatchers.<ConsumerRecord<byte[], byte[]>>any(),
+                    eq(AcknowledgeType.ACCEPT));
+
+            coordinator.queueAck(a, AcknowledgeType.ACCEPT);
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(
+                    () -> coordinator.commitPendingAcks(consumer))
+                .as("InterruptException is control flow (shutdown), never a completable "
+                    + "ack failure — it must propagate")
+                .isInstanceOf(org.apache.kafka.common.errors.InterruptException.class);
+        } finally {
+            // InterruptException's constructor interrupts the current thread; clear the
+            // flag so it can't leak into subsequent tests.
+            Thread.interrupted();
+        }
+    }
+
+    /**
      * After {@code PollLoop.forceReleaseStuckRecords()} RELEASEs an in-flight record because
      * the drain barrier timed out, a stuck-but-eventually-recovering worker may still queue
      * its own ACCEPT for the same record. The broker no longer considers the record acquired
@@ -142,9 +255,9 @@ class AckCoordinatorTest {
         // fired this metric, so manual-ack ACCEPT/REJECT and ListenerInvoker.forManual's
         // auto-RELEASE-on-no-ack were invisible. Centralizing in queueAck covers all
         // origin paths (worker, manual-ack listener, retry decisions, DLT exhaustion).
-        verify(metricsMock).recordsProcessed("t", "accept");
-        verify(metricsMock).recordsProcessed("t", "release");
-        verify(metricsMock).recordsProcessed("t", "reject");
+        verify(metricsMock).recordsProcessed("t", ProcessResult.ACCEPT);
+        verify(metricsMock).recordsProcessed("t", ProcessResult.RELEASE);
+        verify(metricsMock).recordsProcessed("t", ProcessResult.REJECT);
     }
 
     @Test

@@ -1,5 +1,6 @@
 package io.plurima.kafka.dlt;
 
+import io.plurima.kafka.PropertiesSupport;
 import io.plurima.kafka.annotation.Stable;
 
 import java.util.Objects;
@@ -22,7 +23,7 @@ public final class DltConfig {
 
     /** Returns a defensive copy of the producer properties. */
     public Properties producerProperties() {
-        return defensiveCopy(producerProperties);
+        return PropertiesSupport.copy(producerProperties);
     }
 
     public DltTopicNamingStrategy namingStrategy() { return namingStrategy; }
@@ -38,7 +39,7 @@ public final class DltConfig {
         Builder() {}
 
         public Builder producerProperties(Properties props) {
-            this.producerProperties = defensiveCopy(
+            this.producerProperties = PropertiesSupport.copy(
                 Objects.requireNonNull(props, "producerProperties"));
             return this;
         }
@@ -57,23 +58,5 @@ public final class DltConfig {
             Objects.requireNonNull(producerProperties, "producerProperties");
             return new DltConfig(producerProperties, namingStrategy, includeStackTrace);
         }
-    }
-
-    /**
-     * Mirrors {@code internal.PropertiesCopy.copy} — duplicated here because the
-     * arch rule (ADR-012) forbids public-API types from depending on the
-     * {@code ..internal..} package. Preserves entries from the {@code defaults}
-     * chain that {@code Hashtable.putAll} silently drops.
-     */
-    private static Properties defensiveCopy(Properties src) {
-        Properties out = new Properties();
-        out.putAll(src);  // explicit entries (incl. non-String values)
-        for (String key : src.stringPropertyNames()) {
-            if (!out.containsKey(key)) {
-                String value = src.getProperty(key);
-                if (value != null) out.setProperty(key, value);
-            }
-        }
-        return out;
     }
 }

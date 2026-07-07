@@ -83,13 +83,13 @@ class ShareNoMessageLossIntegrationTest {
             .retryOn(RuntimeException.class)
             .build();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(consumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.SHARE)
             .ordering(OrderingMode.UNORDERED)
             .retry(retry)
-            .deadLetterTopic(dlt)
+            .deadLetter(dlt)
             .concurrency(8)
             .pollTimeout(Duration.ofMillis(200))
             .shutdownDrainTimeout(Duration.ofSeconds(15))

@@ -8,8 +8,6 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Optional;
-
 @Internal
 public final class UnorderedDispatcher implements WorkDispatcher {
 
@@ -87,14 +85,9 @@ public final class UnorderedDispatcher implements WorkDispatcher {
         implements ConsumerContext {
 
         @Override
-        public short deliveryCount() {
+        public int deliveryCount() {
             ConsumerRecord<byte[], byte[]> cr = r.consumerRecord();
             return cr.deliveryCount().orElse((short) 1);
-        }
-
-        @Override
-        public Optional<Short> deliveryCountOptional() {
-            return r.consumerRecord().deliveryCount();
         }
 
         @Override

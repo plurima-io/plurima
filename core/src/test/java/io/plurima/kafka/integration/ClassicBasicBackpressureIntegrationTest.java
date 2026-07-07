@@ -60,7 +60,7 @@ class ClassicBasicBackpressureIntegrationTest {
         AtomicInteger invocations = new AtomicInteger();
         CountDownLatch handlerDone = new CountDownLatch(1);
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(props)
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -92,7 +92,7 @@ class ClassicBasicBackpressureIntegrationTest {
         // Verifier consumer in the same group should see ZERO records (offset committed).
         AtomicInteger verifierSaw = new AtomicInteger();
         CountDownLatch verifyDeadline = new CountDownLatch(1);
-        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> verifier = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -138,7 +138,7 @@ class ClassicBasicBackpressureIntegrationTest {
         AtomicInteger concurrentlyRunning = new AtomicInteger();
         AtomicInteger maxConcurrent = new AtomicInteger();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(props)
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)

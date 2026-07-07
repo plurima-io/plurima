@@ -91,13 +91,13 @@ class ClassicBasicDltFailureNoLossIntegrationTest {
         AtomicInteger listenerInvocations = new AtomicInteger();
         Set<String> seenValues = new HashSet<>();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
             .ordering(OrderingMode.PARTITION)         // one worker per partition → predictable order
             .retry(retry)
-            .deadLetterTopic(brokenDlt)
+            .deadLetter(brokenDlt)
             .pollTimeout(Duration.ofMillis(200))
             .shutdownDrainTimeout(Duration.ofSeconds(15))
             .listener((rec, ctx) -> {
@@ -201,13 +201,13 @@ class ClassicBasicDltFailureNoLossIntegrationTest {
 
         // First run: broken DLT — frontier stays stuck.
         AtomicInteger firstRunInvocations = new AtomicInteger();
-        try (PlurimaConsumer<byte[], byte[]> consumer1 = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer1 = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
             .ordering(OrderingMode.PARTITION)
             .retry(retry)
-            .deadLetterTopic(DltConfig.builder()
+            .deadLetter(DltConfig.builder()
                 .namingStrategy(t -> t + ".DLT")
                 .producerProperties(brokenDltProps)
                 .build())
@@ -235,13 +235,13 @@ class ClassicBasicDltFailureNoLossIntegrationTest {
         // (or it should be 0). Hand the same group a HEALTHY DLT and verify all
         // total records route to DLT this time.
         AtomicInteger secondRunInvocations = new AtomicInteger();
-        try (PlurimaConsumer<byte[], byte[]> consumer2 = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer2 = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
             .topic(topic)
             .engine(ConsumerEngine.CLASSIC_BASIC)
             .ordering(OrderingMode.PARTITION)
             .retry(retry)
-            .deadLetterTopic(DltConfig.builder()
+            .deadLetter(DltConfig.builder()
                 .namingStrategy(t -> t + ".DLT")
                 .producerProperties(healthyDltProps)
                 .build())

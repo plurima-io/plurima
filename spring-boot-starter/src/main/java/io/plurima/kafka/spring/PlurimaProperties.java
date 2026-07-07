@@ -12,6 +12,7 @@ import java.util.Map;
  * <p>Example:
  * <pre>{@code
  * plurima:
+ *   enabled: true
  *   bootstrap-servers: localhost:9092
  *   client-id: my-app
  *   properties:
@@ -39,9 +40,20 @@ import java.util.Map;
 @ConfigurationProperties(prefix = "plurima")
 public class PlurimaProperties {
 
+    /**
+     * Master switch for the whole starter, checked by
+     * {@link io.plurima.kafka.spring.PlurimaAutoConfiguration}'s
+     * {@code @ConditionalOnProperty}. Defaults to {@code true}; set
+     * {@code plurima.enabled=false} to suppress autoconfiguration entirely (e.g. in a
+     * test slice that doesn't want any Kafka consumer beans registered).
+     */
+    private boolean enabled = true;
     private String bootstrapServers = "localhost:9092";
     private String clientId;
     private Map<String, String> properties = new HashMap<>();
+
+    public boolean isEnabled() { return enabled; }
+    public void setEnabled(boolean enabled) { this.enabled = enabled; }
 
     public String getBootstrapServers() { return bootstrapServers; }
     public void setBootstrapServers(String bootstrapServers) { this.bootstrapServers = bootstrapServers; }

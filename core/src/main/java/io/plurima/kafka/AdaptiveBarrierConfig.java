@@ -1,6 +1,6 @@
 package io.plurima.kafka;
 
-import io.plurima.kafka.annotation.Stable;
+import io.plurima.kafka.annotation.Experimental;
 
 /**
  * Tuning for the SHARE engine's adaptive drain barrier. When enabled via
@@ -10,9 +10,9 @@ import io.plurima.kafka.annotation.Stable;
  * instead of waiting a flat {@code lockDuration}. SHARE engine only — rejected at
  * build time on {@code CLASSIC_BASIC} (no drain barrier there).
  *
- * @since 0.4.0
+ * @since 0.2.0
  */
-@Stable(since = "0.4.0")
+@Experimental
 public final class AdaptiveBarrierConfig {
 
     private final double percentile;

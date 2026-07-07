@@ -1,6 +1,5 @@
 package io.plurima.kafka.internal;
 
-import io.plurima.kafka.retry.RetryDecision;
 import io.plurima.kafka.retry.RetryPolicy;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.header.internals.RecordHeaders;

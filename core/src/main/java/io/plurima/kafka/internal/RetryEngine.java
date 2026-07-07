@@ -1,7 +1,6 @@
 package io.plurima.kafka.internal;
 
 import io.plurima.kafka.annotation.Internal;
-import io.plurima.kafka.retry.RetryDecision;
 import io.plurima.kafka.retry.RetryPolicy;
 
 import java.time.Duration;

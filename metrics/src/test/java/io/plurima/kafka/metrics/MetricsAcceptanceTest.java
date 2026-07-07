@@ -14,8 +14,8 @@ class MetricsAcceptanceTest {
         MicrometerPlurimaMetrics m = new MicrometerPlurimaMetrics(registry);
 
         m.recordsPolled("orders", 10);
-        m.recordsProcessed("orders", "accept");
-        m.recordsProcessed("orders", "reject");
+        m.recordsProcessed("orders", ProcessResult.ACCEPT);
+        m.recordsProcessed("orders", ProcessResult.REJECT);
         m.recordsFailed("orders", "java.io.IOException");
         m.retryAttempt("orders", 1);
         m.dltRouted("orders", "orders.DLT");
@@ -24,10 +24,10 @@ class MetricsAcceptanceTest {
         m.recordsPoisonPill("orders", "deserialization");
         m.registerInFlightGauge("orders", "group-1", "client-x", () -> 5);
         m.recordProcessDuration("orders", java.time.Duration.ofMillis(10));
-        m.recordPollDuration(java.time.Duration.ofMillis(10));
-        m.ackQueued("ACCEPT");
-        m.ackCommitted("orders", "ACCEPT");
-        m.backpressureEvent("orders", "paused");
+        m.recordPollDuration("orders", "group-1", java.time.Duration.ofMillis(10));
+        m.ackQueued(AckOutcome.ACCEPT);
+        m.ackCommitted("orders", AckOutcome.ACCEPT);
+        m.backpressureEvent("orders", BackpressureEvent.PAUSED);
 
         assertThat(registry.getMeters())
             .extracting(meter -> meter.getId().getName())

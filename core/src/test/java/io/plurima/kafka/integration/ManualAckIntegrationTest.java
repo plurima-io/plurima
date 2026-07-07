@@ -1,8 +1,8 @@
 package io.plurima.kafka.integration;
 
 import io.plurima.kafka.PlurimaConsumer;
+import io.plurima.kafka.ack.AckType;
 import io.plurima.kafka.deserializer.RecordDeserializer;
-import org.apache.kafka.clients.consumer.AcknowledgeType;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -35,7 +35,7 @@ class ManualAckIntegrationTest {
         CountDownLatch latch = new CountDownLatch(2);
         ConcurrentLinkedQueue<String> observations = new ConcurrentLinkedQueue<>();
 
-        try (PlurimaConsumer<byte[], String> consumer = PlurimaConsumer.<byte[], String>builder()
+        try (PlurimaConsumer<byte[], String> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(consumerProps(groupId))
                 .topic(topic)
                 .valueDeserializer(RecordDeserializer.utf8String())
@@ -43,9 +43,9 @@ class ManualAckIntegrationTest {
                 .manualAckListener((r, ack) -> {
                     observations.add(r.value());
                     if (r.value() != null && r.value().startsWith("good-")) {
-                        ack.acknowledge(AcknowledgeType.ACCEPT);
+                        ack.acknowledge(AckType.ACCEPT);
                     } else {
-                        ack.acknowledge(AcknowledgeType.REJECT);
+                        ack.acknowledge(AckType.REJECT);
                     }
                     latch.countDown();
                 })

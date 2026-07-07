@@ -52,7 +52,7 @@ class ShareMessageListenerIntegrationTest {
             latch.countDown();
         };
 
-        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(props).topic(topic).concurrency(8)
             .pollTimeout(Duration.ofMillis(500))
             .onMessage(handler)
@@ -95,7 +95,7 @@ class ShareMessageListenerIntegrationTest {
         CountDownLatch latch = new CountDownLatch(n);
         Properties props = KafkaIntegrationSupport.consumerProps(groupId);
 
-        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(props).topic(topic).concurrency(6)
             .pollTimeout(Duration.ofMillis(500))
             .onMessageAck(msg -> {

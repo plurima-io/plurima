@@ -6,6 +6,33 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 
+/**
+ * A handler-failure retry policy: an attempt cap, an {@link ExceptionClassifier} deciding
+ * which throwables are eligible for retry at all, and exponential-backoff-with-jitter timing
+ * for the delay between attempts. Set on a consumer via
+ * {@link io.plurima.kafka.PlurimaConsumerBuilder#retry}; the default,
+ * {@link #noRetry()}, retries nothing — the first failure is immediately rejected or, if
+ * {@link io.plurima.kafka.PlurimaConsumerBuilder#deadLetter} is configured, routed to the
+ * dead-letter topic.
+ *
+ * <p>Build a custom policy via {@link #exponential()}, which returns an
+ * {@link ExponentialBuilder} defaulting to {@code maxAttempts=3}, {@code initialDelay=100ms},
+ * {@code multiplier=2.0}, {@code jitter=0.2}, and a classifier that never retries unless
+ * {@link ExponentialBuilder#retryOn} or {@link ExponentialBuilder#classifier} is called.
+ * {@link ExponentialBuilder#build()} validates its inputs eagerly:
+ *
+ * <ul>
+ *   <li>{@code maxAttempts} must be {@code >= 0}, else {@link IllegalArgumentException}</li>
+ *   <li>{@code initialDelay} must be positive (not zero, not negative), else
+ *       {@link IllegalArgumentException}</li>
+ *   <li>{@code multiplier} must be finite and {@code >= 1.0}, else
+ *       {@link IllegalArgumentException}</li>
+ *   <li>{@code jitter} must be finite and in {@code [0.0, 1.0]}, else
+ *       {@link IllegalArgumentException}</li>
+ * </ul>
+ *
+ * Instances are immutable and safe to share across consumers.
+ */
 @Stable(since = "0.1.0")
 public final class RetryPolicy {
 

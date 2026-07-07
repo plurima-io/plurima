@@ -59,7 +59,7 @@ class ClassicBasicKeyParallelismIntegrationTest {
         AtomicInteger concurrentlyRunning = new AtomicInteger();
         AtomicInteger maxConcurrent = new AtomicInteger();
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)
@@ -128,7 +128,7 @@ class ClassicBasicKeyParallelismIntegrationTest {
         AtomicInteger maxConcurrent = new AtomicInteger();
         CountDownLatch done = new CountDownLatch(totalRecords);
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(classicConsumerProps(groupId))
                 .topic(topic)
                 .engine(ConsumerEngine.CLASSIC_BASIC)

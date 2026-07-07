@@ -2,7 +2,7 @@ package io.plurima.kafka;
 
 import io.plurima.kafka.ack.AckContext;
 import io.plurima.kafka.ack.AckMessage;
-import org.apache.kafka.clients.consumer.AcknowledgeType;
+import io.plurima.kafka.ack.AckType;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
 import java.util.Objects;
@@ -23,7 +23,7 @@ final class AckRecordMessage<K, V> extends RecordMessage<K, V> implements AckMes
     }
 
     @Override
-    public void acknowledge(AcknowledgeType type) {
+    public void acknowledge(AckType type) {
         ack.acknowledge(type);
     }
 }

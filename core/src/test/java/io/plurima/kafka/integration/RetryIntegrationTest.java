@@ -33,7 +33,7 @@ class RetryIntegrationTest {
         AtomicInteger attempts = new AtomicInteger();
         CountDownLatch succeeded = new CountDownLatch(1);
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
                 .kafkaProperties(consumerProps(groupId))
                 .topic(topic)
                 .pollTimeout(Duration.ofMillis(200))

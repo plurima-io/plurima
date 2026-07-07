@@ -2,6 +2,7 @@ package io.plurima.kafka.internal;
 
 import io.plurima.kafka.OrderingMode;
 import io.plurima.kafka.RecordListener;
+import io.plurima.kafka.ack.AckType;
 import io.plurima.kafka.ack.ManualAckListener;
 import io.plurima.kafka.deserializer.RecordDeserializer;
 import io.plurima.kafka.retry.RetryPolicy;
@@ -83,8 +84,8 @@ class Phase6AcceptanceTest {
         CountDownLatch latch = new CountDownLatch(2);
         ManualAckListener<String, String> listener = (r, ack) -> {
             // Offset 2 → ACCEPT. Offset 3 → REJECT.
-            if (r.offset() == 2L) ack.acknowledge(AcknowledgeType.ACCEPT);
-            else ack.acknowledge(AcknowledgeType.REJECT);
+            if (r.offset() == 2L) ack.acknowledge(AckType.ACCEPT);
+            else ack.acknowledge(AckType.REJECT);
             latch.countDown();
         };
 

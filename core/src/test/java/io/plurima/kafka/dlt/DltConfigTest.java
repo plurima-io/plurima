@@ -75,4 +75,33 @@ class DltConfigTest {
         assertThat(cfg.producerProperties().getProperty("bootstrap.servers"))
             .isEqualTo("localhost:9092");
     }
+
+    @Test
+    void defaultsBackedProducerPropertiesArePreserved() {
+        // Mirrors PropertiesCopyTest.defaultsBackedEntriesArePreserved for the public
+        // PropertiesSupport.copy path: DltConfig.Builder.producerProperties(...) and
+        // DltConfig.producerProperties() both route through PropertiesSupport.copy, which
+        // must walk the Properties(defaults) chain rather than a bare putAll (that would
+        // silently drop bootstrap.servers/group.id here).
+        Properties defaults = new Properties();
+        defaults.setProperty("bootstrap.servers", "broker:9092");
+        defaults.setProperty("group.id", "g");
+        Properties live = new Properties(defaults);
+        live.setProperty("client.id", "c");          // shadowed in `live`, not in defaults
+
+        DltConfig cfg = DltConfig.builder()
+            .producerProperties(live)
+            .build();
+
+        Properties copy = cfg.producerProperties();
+        assertThat(copy.getProperty("bootstrap.servers"))
+            .as("defaults-backed value must be copied")
+            .isEqualTo("broker:9092");
+        assertThat(copy.getProperty("group.id"))
+            .as("defaults-backed value must be copied")
+            .isEqualTo("g");
+        assertThat(copy.getProperty("client.id"))
+            .as("explicit value must be copied")
+            .isEqualTo("c");
+    }
 }

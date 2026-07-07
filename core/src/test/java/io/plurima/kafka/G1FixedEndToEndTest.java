@@ -64,7 +64,7 @@ class G1FixedEndToEndTest {
         ConcurrentLinkedQueue<Long> offsetsSeen = new ConcurrentLinkedQueue<>();
         CountDownLatch allReceived = new CountDownLatch(recordCount);
 
-        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.<byte[], byte[]>builder()
+        try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(cProps)
             .topic(topic)
             .concurrency(10)

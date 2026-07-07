@@ -1,5 +1,7 @@
 // Gradle 8.14+ compatible configuration (core plugins are automatically available)
 
+import org.gradle.testing.jacoco.tasks.JacocoReport
+
 val publishedModules = setOf("core", "metrics", "spring-boot-starter")
 
 tasks.register("quickstart") {
@@ -17,13 +19,14 @@ tasks.register("benchmark") {
 allprojects {
     group = "io.plurima"
     // master branch carries the NEXT version as -SNAPSHOT. To cut a release:
-    //   1. checkout the release branch, change to e.g. "0.2.0" (no suffix),
-    //   2. tag v0.2.0 and push the tag — release.yml verifies tag matches version
+    //   1. checkout the release branch, change to e.g. "0.3.0" (no suffix),
+    //   2. tag v0.3.0 and push the tag — release.yml verifies tag matches version
     //      and publishes to Sonatype releases
-    //   3. bump master to the next patch snapshot, e.g. "0.2.1-SNAPSHOT"
-    // The ci.yml publish-snapshot job refuses non-SNAPSHOT versions as a hard guard
-    // (so a misconfigured branch on master cannot accidentally publish a real release).
-    version = "0.2.0"
+    //   3. bump master to the next patch snapshot, e.g. "0.3.1-SNAPSHOT"
+    // The ci.yml publish-snapshot job FAILS the build (not skips) if master ever
+    // carries a non-SNAPSHOT version, so a misconfigured branch on master cannot
+    // silently skip publishing or accidentally publish a real release.
+    version = "0.3.0-SNAPSHOT"
 }
 
 subprojects {
@@ -47,6 +50,13 @@ subprojects {
         tasks.withType<ProcessResources>().configureEach {
             includeEmptyDirs = false
         }
+        // Reproducible archives: strip timestamps and normalize entry order so `jar`/`sourcesJar`/
+        // `javadocJar` outputs are byte-for-byte identical across runs given identical inputs —
+        // a prerequisite for build reproducibility / supply-chain verification tooling.
+        tasks.withType<AbstractArchiveTask>().configureEach {
+            isPreserveFileTimestamps = false
+            isReproducibleFileOrder = true
+        }
         // Published Javadocs document the PUBLIC API only. Skip the io.plurima.kafka.internal
         // package (everything inside is @Internal — explicitly not for downstream use) so the
         // generated docs match the actual stability contract.
@@ -68,6 +78,26 @@ subprojects {
     plugins.withId("java-library") {
         if (name !in publishedModules) {
             return@withId
+        }
+
+        // Coverage reporting for the published modules (core, metrics, spring-boot-starter).
+        // Report-only for now: `check` runs `jacocoTestReport` so every build produces an
+        // up-to-date coverage report under build/reports/jacoco/, but there is deliberately
+        // NO `jacocoTestCoverageVerification` / minimum-coverage gate yet. This branch has no
+        // agreed coverage baseline to enforce against — an arbitrary threshold today would
+        // either be too low to mean anything or fail the build on modules nobody has actually
+        // measured. Follow-up: once a few report runs establish a real baseline, add
+        // verification rules gating `check` on regressions.
+        apply(plugin = "jacoco")
+        tasks.named<JacocoReport>("jacocoTestReport") {
+            dependsOn(tasks.named("test"))
+            reports {
+                xml.required.set(true)
+                html.required.set(true)
+            }
+        }
+        tasks.named("check") {
+            dependsOn(tasks.named("jacocoTestReport"))
         }
 
         extensions.configure<JavaPluginExtension> {
@@ -114,7 +144,11 @@ subprojects {
                 }
             }
             repositories {
-                mavenLocal()
+                // No mavenLocal() here: `publishToMavenLocal` is still available (it's wired
+                // implicitly by maven-publish regardless of the `repositories {}` block below),
+                // but we don't want it listed as a `publish` target — that would make a plain
+                // `./gradlew publish` silently write to ~/.m2 in addition to Sonatype.
+                //
                 // Sonatype Central Portal compatibility endpoints. OSSRH was shut down in
                 // 2025; the staging API below accepts Maven-style PUT uploads and the
                 // release workflow performs the required Portal handoff after publishing.

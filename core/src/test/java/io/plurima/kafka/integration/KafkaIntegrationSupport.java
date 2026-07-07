@@ -27,7 +27,11 @@ import java.util.concurrent.TimeUnit;
  */
 public final class KafkaIntegrationSupport {
 
-    public static final String BOOTSTRAP = "localhost:9092";
+    // Overridable so integration tests can run against a broker other than localhost:9092
+    // (e.g. CI containers, remote test clusters) without editing source: -Dplurima.test.bootstrap
+    // takes precedence, then the PLURIMA_TEST_BOOTSTRAP env var, then the localhost default.
+    public static final String BOOTSTRAP = System.getProperty(
+        "plurima.test.bootstrap", System.getenv().getOrDefault("PLURIMA_TEST_BOOTSTRAP", "localhost:9092"));
 
     /**
      * Defensive lower bound for {@link #waitForAssignment} — even if AdminClient reports

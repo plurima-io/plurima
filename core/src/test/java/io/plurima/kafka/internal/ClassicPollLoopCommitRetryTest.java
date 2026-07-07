@@ -3,6 +3,7 @@ package io.plurima.kafka.internal;
 import io.plurima.kafka.OrderingMode;
 import io.plurima.kafka.RecordListener;
 import io.plurima.kafka.deserializer.RecordDeserializer;
+import io.plurima.kafka.metrics.AckOutcome;
 import io.plurima.kafka.metrics.PlurimaMetrics;
 import io.plurima.kafka.retry.RetryPolicy;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -50,9 +51,13 @@ class ClassicPollLoopCommitRetryTest {
     }
 
     private ClassicPollLoop<byte[], byte[]> newLoop() {
+        return newLoop(PlurimaMetrics.noOp());
+    }
+
+    private ClassicPollLoop<byte[], byte[]> newLoop(PlurimaMetrics metrics) {
         RecordListener<byte[], byte[]> listener = (r, ctx) -> {};
         return new ClassicPollLoop<>(
-            consumer, "t", listener,
+            consumer, "t", "g1", listener,
             RecordDeserializer.bytes(), RecordDeserializer.bytes(),
             OrderingMode.PARTITION,
             new RetryEngine(RetryPolicy.noRetry()),
@@ -61,7 +66,7 @@ class ClassicPollLoopCommitRetryTest {
             /* shutdownDrainTimeoutMs */ 1_000L,
             /* concurrency */ 8,
             /* shardCount */ 16,
-            PlurimaMetrics.noOp(), launcher,
+            metrics, launcher,
             /* onLoopExit */ () -> {});
     }
 
@@ -310,6 +315,50 @@ class ClassicPollLoopCommitRetryTest {
         // longer own. Verify by triggering another drain and asserting no new
         // commitAsync calls for tp.
         org.mockito.Mockito.reset(consumer);
+        loop.drainPendingCommits();
+        verify(consumer, never()).commitAsync(any(Map.class), any(OffsetCommitCallback.class));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void finalShutdownCommitSyncRetriesOnceWhenArmedWakeupFires() {
+        // shutdown() sets running=false then calls consumer.wakeup(). If the poll
+        // thread is between polls when this happens, the armed wakeup doesn't fire
+        // at poll() (nothing is polling) — it fires at the very next blocking call
+        // into the consumer, which is the final commitSync in drainPendingCommitsSync.
+        // Without a retry, that WakeupException would be swallowed by the generic
+        // failure handler and the last batch of offsets would silently go
+        // uncommitted. Since KafkaConsumer.wakeup() only arms ONE interrupt, a
+        // single retry is guaranteed to get a clean commitSync.
+        TopicPartition tp = new TopicPartition("t", 0);
+        PlurimaMetrics metrics = mock(PlurimaMetrics.class);
+        ClassicPollLoop<byte[], byte[]> loop = newLoop(metrics);
+        CommitFrontier f = loop.installFrontier(tp, 0L);
+        loop.markComplete(f, tp, 0L);
+        loop.markComplete(f, tp, 1L);
+        loop.markComplete(f, tp, 2L);
+
+        Map<TopicPartition, OffsetAndMetadata> expected = Map.of(tp, new OffsetAndMetadata(3L));
+        doAnswer(invocation -> {
+            throw new org.apache.kafka.common.errors.WakeupException();
+        }).doAnswer(invocation -> null)
+            .when(consumer).commitSync(eq(expected));
+
+        loop.drainPendingCommitsSync();
+
+        // The wakeup-interrupted attempt was retried and the offsets WERE committed.
+        verify(consumer, times(2)).commitSync(eq(expected));
+
+        // Success bookkeeping ran: the commit was recorded as accepted...
+        verify(metrics).ackCommitted("t", AckOutcome.ACCEPT);
+        // ...and the error path was NEVER taken — the WakeupException must not be
+        // treated as a commit failure.
+        verify(metrics, never()).ackCommitFailed(
+            org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString());
+
+        // Post-commit state is fully resolved: committedHighWater now covers offset 3
+        // and no failure/in-flight buffers remain, so a subsequent drain has nothing
+        // to (re-)commit.
         loop.drainPendingCommits();
         verify(consumer, never()).commitAsync(any(Map.class), any(OffsetCommitCallback.class));
     }

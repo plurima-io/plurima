@@ -452,7 +452,7 @@ class PollLoopTest {
         return new PollLoop(
             consumer, dispatcher, coordinator, registry, gate,
             pollTimeout, lockDuration, Duration.ofSeconds(5), lockDuration,
-            io.plurima.kafka.metrics.PlurimaMetrics.noOp(), "t",
+            io.plurima.kafka.metrics.PlurimaMetrics.noOp(), "t", "g1",
             /* onLoopExit */ null, window, config);
     }
 
