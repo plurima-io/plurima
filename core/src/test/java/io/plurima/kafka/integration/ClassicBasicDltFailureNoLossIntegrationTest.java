@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -89,7 +90,7 @@ class ClassicBasicDltFailureNoLossIntegrationTest {
             .build();
 
         AtomicInteger listenerInvocations = new AtomicInteger();
-        Set<String> seenValues = new HashSet<>();
+        Set<String> seenValues = ConcurrentHashMap.newKeySet();
 
         try (PlurimaConsumer<byte[], byte[]> consumer = PlurimaConsumer.builder()
             .kafkaProperties(classicConsumerProps(groupId))
@@ -110,14 +111,18 @@ class ClassicBasicDltFailureNoLossIntegrationTest {
             consumer.start();
             waitForClassicAssignment(groupId, 1, 1);
 
-            // Wait until every record has been invoked at least once.
+            // Wait until the first record has been invoked at least once. DLT-failure
+            // backpressure pauses the affected partition after the first failed DLT
+            // publish, so later records should not be required to run in this broken-DLT
+            // window. The separate recovery test below proves the paused/stuck records
+            // redeliver and route once DLT is healthy.
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
-            while (seenValues.size() < total && System.nanoTime() < deadline) {
+            while (!seenValues.contains("v0") && System.nanoTime() < deadline) {
                 Thread.sleep(200);
             }
             assertThat(seenValues)
-                .as("each record must be delivered to the listener at least once")
-                .hasSize(total);
+                .as("first failing record must be delivered to the listener before DLT-failure backpressure pauses")
+                .contains("v0");
         } finally {
             // close happens in try-with-resources above — consumer shuts down here
         }

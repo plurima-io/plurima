@@ -138,6 +138,12 @@ class MicrometerLiveEmissionIntegrationTest {
             assertThat(failingAttempts.get())
                 .as("failing record must attempt 3 times before exhaustion")
                 .isEqualTo(3);
+
+            Gauge inFlight = required(registry, "plurima.consumer.records.in_flight", Gauge.class,
+                "topic", topic, "group_id", groupId, "client_id", clientId);
+            assertThat(inFlight.value())
+                .as("in_flight gauge is registered while the consumer is open and drained")
+                .isEqualTo(0.0);
         }
 
         // ────── Assertions against the SimpleMeterRegistry ──────
@@ -192,14 +198,6 @@ class MicrometerLiveEmissionIntegrationTest {
             .as("process timer observation count covers every listener invocation")
             .isGreaterThanOrEqualTo(total);
 
-        Gauge inFlight = required(registry, "plurima.consumer.records.in_flight", Gauge.class,
-            "topic", topic, "group_id", groupId, "client_id", clientId);
-        // After shutdown drain the gauge should read 0; the assertion shape proves the
-        // gauge was registered with the right tags, not that it ever observed > 0.
-        assertThat(inFlight.value())
-            .as("in_flight gauge reads zero after drain")
-            .isEqualTo(0.0);
-
         // Final smoke check: enumerate every Plurima meter and assert its name follows
         // the documented {@code plurima.consumer.*} prefix — guards against an accidental
         // misnamed meter slipping in via a future code path.
@@ -221,7 +219,6 @@ class MicrometerLiveEmissionIntegrationTest {
             "plurima.consumer.poll.duration",
             "plurima.consumer.process.duration",
             "plurima.consumer.records.failed",
-            "plurima.consumer.records.in_flight",
             "plurima.consumer.records.polled",
             "plurima.consumer.records.processed",
             "plurima.consumer.retry.attempts"
@@ -277,6 +274,12 @@ class MicrometerLiveEmissionIntegrationTest {
             // SHARE's ack.committed fires asynchronously via the broker callback. Brief
             // settle so we can assert on it below without flakes.
             Thread.sleep(1_500);
+
+            Gauge inFlight = required(registry, "plurima.consumer.records.in_flight", Gauge.class,
+                "topic", topic, "group_id", groupId, "client_id", clientId);
+            assertThat(inFlight.value())
+                .as("in_flight gauge is registered while the consumer is open and drained")
+                .isEqualTo(0.0);
         }
 
         // Cover the metrics that SHARE specifically emits (ack.queued is share-only by
@@ -303,10 +306,6 @@ class MicrometerLiveEmissionIntegrationTest {
 
         Timer pollDuration = required(registry, "plurima.consumer.poll.duration", Timer.class);
         assertThat(pollDuration.count()).isGreaterThanOrEqualTo(1);
-
-        Gauge inFlight = required(registry, "plurima.consumer.records.in_flight", Gauge.class,
-            "topic", topic, "group_id", groupId, "client_id", clientId);
-        assertThat(inFlight.value()).isEqualTo(0.0);
 
         // createTopic provisions both `topic` and `topic + ".DLT"` for symmetry with
         // the classic test; clean up both even though SHARE didn't write to the DLT.
