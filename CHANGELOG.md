@@ -4,7 +4,7 @@ All notable changes to Plurima are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.3.0
+## [0.3.0] — 2026-07-08
 
 Public-API hardening, core concurrency/correctness fixes, metrics/Spring polish,
 and build/CI supply-chain hardening. This release contains **breaking changes**;
@@ -274,6 +274,7 @@ ordering on share groups was never load-bearing across the cluster.
 
 Internal pre-release iterations. No published artifacts. See git history for context.
 
-[Unreleased]: https://github.com/plurima-io/plurima/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/plurima-io/plurima/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/plurima-io/plurima/releases/tag/v0.3.0
 [0.2.0]: https://github.com/plurima-io/plurima/releases/tag/v0.2.0
 [0.1.0]: https://github.com/plurima-io/plurima/releases/tag/v0.1.0
