@@ -2,7 +2,7 @@
 
 > A production-grade abstraction over `KafkaShareConsumer` (KIP-932) and vanilla `KafkaConsumer`. Share-group fan-out, classic per-key ordering with intra-partition parallelism, exponential retry, dead-letter routing, and Spring Boot integration.
 
-**Status:** v0.3.0 (unreleased) — this guide documents the hardened public API: a
+**Status:** v0.3.0 — this guide documents the hardened public API: a
 non-generic `builder()` with a `keyDeserializer`/`valueDeserializer` re-typing chain,
 `AckType` and `MessageHeaders` (replacing Kafka's `AcknowledgeType`/`Headers` on the
 public surface), `int deliveryCount()`, `deadLetter(...)` (renamed from
@@ -97,10 +97,10 @@ kafka-share-groups.sh --bootstrap-server localhost:9092 \
 
 ```kotlin
 dependencies {
-    implementation("io.plurima:kafka-plurima-core:0.2.0")
+    implementation("io.plurima:kafka-plurima-core:0.3.0")
     // Optional:
-    implementation("io.plurima:kafka-plurima-metrics:0.2.0")
-    implementation("io.plurima:kafka-plurima-spring-boot-starter:0.2.0")
+    implementation("io.plurima:kafka-plurima-metrics:0.3.0")
+    implementation("io.plurima:kafka-plurima-spring-boot-starter:0.3.0")
 }
 ```
 
@@ -766,7 +766,7 @@ Plurima emits 15 metrics: 11 counters, 2 gauges, and 2 timers.
 | `plurima.consumer.process.duration` | Timer | `topic` | Listener invocation latency |
 | `plurima.consumer.poll.duration` | Timer | `topic`, `group_id` | Duration of a single poll() call |
 
-Metric names are **stable for the 0.2.x line**, with the one intentional rename
+Metric names are **stable for the 0.3.x line**, with the one intentional rename
 noted above (`barrier.timeout_ms` → `barrier.timeout`) shipping in 0.3.0. Additional
 metrics may be added in future minor releases without removing or renaming existing
 public metrics.
@@ -797,7 +797,7 @@ The starter auto-configures `PlurimaConsumer` instances for any `@PlurimaListene
 ### Add the starter
 
 ```kotlin
-implementation("io.plurima:kafka-plurima-spring-boot-starter:0.2.0")
+implementation("io.plurima:kafka-plurima-spring-boot-starter:0.3.0")
 ```
 
 ### Configure `application.yml`

@@ -14,7 +14,7 @@ Production-grade Kafka consumer abstraction over Kafka 4.2 share groups
 Plurima gives Java services a single API for high-concurrency message processing,
 retry, dead-letter routing, metrics, and Spring Boot integration.
 
-**Current version:** `0.2.0`
+**Current version:** `0.3.0`
 
 ## Why Plurima
 
@@ -71,9 +71,9 @@ From a source checkout, run the benchmark against a local Kafka broker with:
 
 | Module | Maven coordinate | Purpose |
 |---|---|---|
-| `core` | `io.plurima:kafka-plurima-core:0.2.0` | Consumer runtime, retry, DLT, ordering, public API |
-| `metrics` | `io.plurima:kafka-plurima-metrics:0.2.0` | Micrometer implementation of `PlurimaMetrics` |
-| `spring-boot-starter` | `io.plurima:kafka-plurima-spring-boot-starter:0.2.0` | Spring Boot auto-configuration and `@PlurimaListener` |
+| `core` | `io.plurima:kafka-plurima-core:0.3.0` | Consumer runtime, retry, DLT, ordering, public API |
+| `metrics` | `io.plurima:kafka-plurima-metrics:0.3.0` | Micrometer implementation of `PlurimaMetrics` |
+| `spring-boot-starter` | `io.plurima:kafka-plurima-spring-boot-starter:0.3.0` | Spring Boot auto-configuration and `@PlurimaListener` |
 
 ## Requirements
 
@@ -107,11 +107,11 @@ See [examples/README.md](examples/README.md) for cleanup and troubleshooting.
 
 ```kotlin
 dependencies {
-    implementation("io.plurima:kafka-plurima-core:0.2.0")
+    implementation("io.plurima:kafka-plurima-core:0.3.0")
 
     // Optional integrations
-    implementation("io.plurima:kafka-plurima-metrics:0.2.0")
-    implementation("io.plurima:kafka-plurima-spring-boot-starter:0.2.0")
+    implementation("io.plurima:kafka-plurima-metrics:0.3.0")
+    implementation("io.plurima:kafka-plurima-spring-boot-starter:0.3.0")
 }
 ```
 
@@ -278,9 +278,10 @@ placeholders — `concurrency` is a `String` for exactly that reason.
 
 ## Project Status
 
-`0.2.0` builds on the first public release with a Kafka-decoupled `Message` handler
-API, SHARE handler timeouts, lock-duration auto-alignment, and slowness-aware retry
-budgeting. The project includes live Kafka integration coverage in CI.
+`0.3.0` hardens the public API and runtime: Kafka-free ack/header types, typed
+metrics tags, consumer lifecycle state and fatal-error callbacks, classic-engine
+ordering and commit fixes, Spring Boot placeholder support, and CI/release
+supply-chain hardening. The project includes live Kafka integration coverage in CI.
 
 ## License
 
