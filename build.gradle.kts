@@ -26,7 +26,7 @@ allprojects {
     // The ci.yml publish-snapshot job FAILS the build (not skips) if master ever
     // carries a non-SNAPSHOT version, so a misconfigured branch on master cannot
     // silently skip publishing or accidentally publish a real release.
-    version = "0.3.1-SNAPSHOT"
+    version = "0.3.0"
 }
 
 subprojects {
