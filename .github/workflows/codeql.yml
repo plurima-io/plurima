@@ -40,6 +40,6 @@ jobs:
         uses: github/codeql-action/autobuild@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3.36.3
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3.36.3
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           category: "/language:java-kotlin"
